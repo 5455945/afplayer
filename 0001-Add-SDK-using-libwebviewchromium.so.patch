@@ -1,4 +1,4 @@
-From 2938abbce3c39a58ce612ca42475e50c3f40e418 Mon Sep 17 00:00:00 2001
+From c8e802d8c61823e3180634bcbd3d726ec524e92b Mon Sep 17 00:00:00 2001
 From: "zhangfengjiang.zfj" <zhangfengjiang.zfj@alibaba-inc.com>
 Date: Mon, 17 Aug 2026 14:00:50 +0800
 Subject: [PATCH] Add SDK using libwebviewchromium.so
@@ -8,9 +8,9 @@ Subject: [PATCH] Add SDK using libwebviewchromium.so
  android_webview/BUILD.gn                      |    5 +-
  android_webview/afree/BUILD.gn                |  289 +
  android_webview/afree/README.md               |  420 +
- android_webview/afree/bootstrap.sh            |  429 +
+ android_webview/afree/bootstrap.sh            |  437 +
  android_webview/afree/demo/.gitignore         |   14 +
- android_webview/afree/demo/build.gradle       |  105 +
+ android_webview/afree/demo/build.gradle       |  107 +
  android_webview/afree/demo/gradle.properties  |    2 +
  .../demo/gradle/wrapper/gradle-wrapper.jar    |  Bin 0 -> 43462 bytes
  .../gradle/wrapper/gradle-wrapper.properties  |    7 +
@@ -105,7 +105,7 @@ Subject: [PATCH] Add SDK using libwebviewchromium.so
  .../webview/chromium/GraphicsUtils.java       |   25 +
  .../afree/renderer/AfreeRenderView.java       |   70 +
  .../src/main/java/org/jni_zero/GEN_JNI.java   | 7388 +++++++++++++++++
- android_webview/afree/spec.md                 |  828 ++
+ android_webview/afree/spec.md                 |  830 ++
  .../afree/tools/inject_and_sign_apk.py        |  121 +
  .../afree/tools/screenshot_analyze.py         |  254 +
  android_webview/afree/tools/verify_scroll.sh  |   75 +
@@ -129,7 +129,7 @@ Subject: [PATCH] Add SDK using libwebviewchromium.so
  .../input/widget_input_handler_manager.h      |   12 +
  .../org/chromium/ui/base/ClipboardImpl.java   |   30 +-
  .../ui/gfx/ViewConfigurationHelper.java       |    4 +-
- 125 files changed, 18194 insertions(+), 52 deletions(-)
+ 125 files changed, 18206 insertions(+), 52 deletions(-)
  create mode 100644 AGENTS.md
  create mode 100644 android_webview/afree/BUILD.gn
  create mode 100644 android_webview/afree/README.md
@@ -683,7 +683,7 @@ index 00000000000..b73a5015814
 +}
 diff --git a/android_webview/afree/README.md b/android_webview/afree/README.md
 new file mode 100644
-index 00000000000..196831087f8
+index 00000000000..ea1d7e7ade3
 --- /dev/null
 +++ b/android_webview/afree/README.md
 @@ -0,0 +1,420 @@
@@ -804,8 +804,8 @@ index 00000000000..196831087f8
 +JAVA_HOME=$PWD/../../third_party/jdk/current ./bootstrap.sh out/DefaultSys_arm64 arm64-v8a 1
 +```
 +
-+`bootstrap.sh` 完成：复制 `afree_webview.aar` → 生成 `androidx-deps.jar` → 解包
-+assets → `demo/gradlew assembleRelease`。
++`bootstrap.sh` 完成：复制 `afree_webview.aar` → 生成 `androidx-deps.jar`（并复制到
++`demo/src/main/libs/`，demo 不依赖 `sdk/` 目录）→ 解包 assets → `demo/gradlew assembleRelease`。
 +
 +> 前置：需先 `autoninja -C out/DefaultSys_arm64 android_webview/afree:afree_webview_aar`
 +> 生成 dist_aar AAR。
@@ -1109,10 +1109,10 @@ index 00000000000..196831087f8
 +> 都必须跑一遍本脚本，确认视频硬解上屏未回归。
 diff --git a/android_webview/afree/bootstrap.sh b/android_webview/afree/bootstrap.sh
 new file mode 100755
-index 00000000000..3a96e86093d
+index 00000000000..80fd16ec051
 --- /dev/null
 +++ b/android_webview/afree/bootstrap.sh
-@@ -0,0 +1,429 @@
+@@ -0,0 +1,437 @@
 +#!/bin/bash
 +# =============================================================================
 +# bootstrap.sh — afree AAR/Demo environment bootstrap script
@@ -1301,6 +1301,14 @@ index 00000000000..3a96e86093d
 +    mkdir -p "$AAR_DIR/src/main/libs"
 +    make_androidx_deps_jar "$AAR_DIR/src/main/libs/androidx-deps.jar"
 +    log "  androidx-deps.jar ($(du -h "$AAR_DIR/src/main/libs/androidx-deps.jar" | cut -f1))"
++
++    # Make the demo self-contained: copy androidx-deps.jar into the demo's own
++    # libs/ so demo/build.gradle references 'src/main/libs/androidx-deps.jar'
++    # instead of '../sdk/...'. chromium-deps.jar / androidx_annotation.jar stay
++    # sdk-only (they are only used by the sdk's hand-rolled Gradle build).
++    mkdir -p "$DEMO_DIR/src/main/libs"
++    cp "$AAR_DIR/src/main/libs/androidx-deps.jar" "$DEMO_DIR/src/main/libs/androidx-deps.jar"
++    log "  androidx-deps.jar copied to demo/src/main/libs/ ($(du -h "$DEMO_DIR/src/main/libs/androidx-deps.jar" | cut -f1))"
 +
 +    # NOTE: keep demo/src/main/assets intact — it holds the demo's own Markdown
 +    # docs (help/copyright/readme/issues.md + md.css/template.html). The runtime
@@ -1564,10 +1572,10 @@ index 00000000000..ca0a6ce1de3
 +!src/main/libs/.gitkeep
 diff --git a/android_webview/afree/demo/build.gradle b/android_webview/afree/demo/build.gradle
 new file mode 100644
-index 00000000000..2720b0548b8
+index 00000000000..4549d3e5217
 --- /dev/null
 +++ b/android_webview/afree/demo/build.gradle
-@@ -0,0 +1,105 @@
+@@ -0,0 +1,107 @@
 +plugins {
 +    id 'com.android.application' version '8.5.0'
 +}
@@ -1664,9 +1672,11 @@ index 00000000000..2720b0548b8
 +    // Hand-rolled mode: the sdk AAR is only the com.afree.* shell, so the demo
 +    // needs chromium-deps.jar (chromium + androidx + kotlin classes) at runtime.
 +    // dist_aar mode: the AAR is self-contained (chromium classes) and excludes
-+    // androidx, so the demo needs androidx-deps.jar instead.
++    // androidx, so the demo needs androidx-deps.jar instead. bootstrap.sh copies
++    // it into demo/src/main/libs/, so the demo has no dependency on the sdk/
++    // directory (and opens cleanly in Android Studio).
 +    if (afreeAarIsDist) {
-+        implementation files('../sdk/src/main/libs/androidx-deps.jar')
++        implementation files('src/main/libs/androidx-deps.jar')
 +    } else {
 +        implementation files('../sdk/src/main/libs/chromium-deps.jar')
 +    }
@@ -22106,10 +22116,10 @@ index 00000000000..be0c58c377c
 +}
 diff --git a/android_webview/afree/spec.md b/android_webview/afree/spec.md
 new file mode 100644
-index 00000000000..fcac7ff194d
+index 00000000000..ba60d272d20
 --- /dev/null
 +++ b/android_webview/afree/spec.md
-@@ -0,0 +1,828 @@
+@@ -0,0 +1,830 @@
 +# afree WebView — 可执行规格（Spec）
 +
 +> 本文档是**机器可执行的生成规格**，目标：让一个熟悉 Chromium 结构与 AOSP
@@ -22675,7 +22685,9 @@ index 00000000000..fcac7ff194d
 +1. `CHROMIUM_DIR = SCRIPT_DIR/../..`（afree 在 android_webview/afree/，两级到仓库根）
 +2. 校验 `libwebviewchromium.so` + `apks/AfreeWebViewDemo.apk` + `apks/afree_webview.aar` 存在
 +3. 复制 `afree_webview.aar` → `demo/src/main/libs/afree_webview.aar`
-+4. `make_androidx_deps_jar` 生成 `androidx-deps.jar`（18 个 androidx/android_deps/kotlin 库，见 §8.1）
++4. `make_androidx_deps_jar` 生成 `androidx-deps.jar`（18 个 androidx/android_deps/kotlin 库，见 §8.1），
++   并复制到 `demo/src/main/libs/androidx-deps.jar`——demo 只依赖本地 jar，不依赖 `../sdk` 目录
++   （`chromium-deps.jar`/`androidx_annotation.jar` 仅供 sdk 手搓模式自身构建，demo 用不到）
 +5. 清空 `demo/src/main/assets`（AAR 自带 assets，AGP 自动合并到 APK）
 +6. 可选：`demo/gradlew assembleRelease`
 +
@@ -24253,5 +24265,5 @@ index 1a2b8e12106..956031b5cf7 100644
                      TypedValue.applyDimension(
                              TypedValue.COMPLEX_UNIT_MM,
 -- 
-2.54.0
+2.55.0
 
