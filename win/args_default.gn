@@ -1,0 +1,16 @@
+cc_wrapper="sccache"
+target_os="win"
+target_cpu="x64"
+is_component_build=false
+is_debug=false
+is_official_build=true
+google_api_key=false
+google_default_client_id=false
+google_default_client_secret=false
+proprietary_codecs=true
+media_use_ffmpeg=true
+ffmpeg_branding="Chrome"
+enable_mse_mpeg2ts_stream_parser=true
+symbol_level=1
+blink_symbol_level=1
+v8_symbol_level=1
