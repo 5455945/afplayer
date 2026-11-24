@@ -1,0 +1,71 @@
+From be5279b63096482b2d46c0f1354672f815c24f74 Mon Sep 17 00:00:00 2001
+From: "5455945@gmail.com" <5455945@gmail.com>
+Date: Tue, 24 Nov 2026 15:45:43 +0800
+Subject: [PATCH] afree: show afree in the chrome-webui security chip
+
+---
+ chrome/browser/ui/views/location_bar/BUILD.gn |  1 +
+ .../location_icon_state_helper.cc             | 19 ++++++++++++++++++-
+ 2 files changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/chrome/browser/ui/views/location_bar/BUILD.gn b/chrome/browser/ui/views/location_bar/BUILD.gn
+index 05615e7212..551d7adaf6 100644
+--- a/chrome/browser/ui/views/location_bar/BUILD.gn
++++ b/chrome/browser/ui/views/location_bar/BUILD.gn
+@@ -111,6 +111,7 @@ source_set("impl") {
+       "//chrome/app/vector_icons",
+       "//chrome/browser:primitives",
+       "//chrome/browser/actor/ui",
++      "//chrome/common:chrome_executable_name_buildflags",
+       "//chrome/browser/autocomplete",
+       "//chrome/browser/autocomplete:aim_eligibility_service",
+       "//chrome/browser/contextual_search",
+diff --git a/chrome/browser/ui/views/location_bar/location_icon_state_helper.cc b/chrome/browser/ui/views/location_bar/location_icon_state_helper.cc
+index 16523a13c5..33d416885a 100644
+--- a/chrome/browser/ui/views/location_bar/location_icon_state_helper.cc
++++ b/chrome/browser/ui/views/location_bar/location_icon_state_helper.cc
+@@ -4,8 +4,12 @@
+ 
+ #include "chrome/browser/ui/views/location_bar/location_icon_state_helper.h"
+ 
++#include <string_view>
++
++#include "base/strings/utf_string_conversions.h"
+ #include "build/branding_buildflags.h"
+ #include "chrome/browser/extensions/extension_ui_util.h"
++#include "chrome/common/chrome_executable_name_buildflags.h"
+ #include "chrome/grit/branded_strings.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/contextual_tasks/public/features.h"
+@@ -29,6 +33,19 @@
+ 
+ namespace location_bar {
+ 
++namespace {
++
++std::u16string GetProductNameForSecurityChip() {
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++  return base::UTF8ToUTF16(
++      std::string_view(BUILDFLAG(CHROME_EXECUTABLE_NAME)));
++#else
++  return l10n_util::GetStringUTF16(IDS_SHORT_PRODUCT_NAME);
++#endif
++}
++
++}  // namespace
++
+ std::u16string GetSecurityChipText(const LocationBarModel* model,
+                                    content::WebContents* web_contents,
+                                    bool is_editing_or_empty) {
+@@ -39,7 +56,7 @@ std::u16string GetSecurityChipText(const LocationBarModel* model,
+   if (model->GetURL().SchemeIs(content::kChromeUIScheme) ||
+       (contextual_tasks::ShouldShowExpandedSecurityChip() &&
+        model->IsContextualTasksPage())) {
+-    return l10n_util::GetStringUTF16(IDS_SHORT_PRODUCT_NAME);
++    return GetProductNameForSecurityChip();
+   }
+ 
+   if (model->GetURL().SchemeIs(url::kFileScheme)) {
+-- 
+2.56.1
+
