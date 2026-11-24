@@ -1,0 +1,563 @@
+From a2ca70392ae2825492f8132e487a0f78497d1e5a Mon Sep 17 00:00:00 2001
+From: "5455945@gmail.com" <5455945@gmail.com>
+Date: Tue, 24 Nov 2026 10:28:27 +0800
+Subject: [PATCH 2/3] afree: rename helper and tool processes (patch 2/3)
+
+---
+ build/BUILD.gn                                 | 18 ++++++++++++++++++
+ build/config/BUILDCONFIG.gn                    |  4 ++++
+ chrome/BUILD.gn                                | 18 +++++++++++-------
+ .../installer/management_service/BUILD.gn      |  1 +
+ chrome/browser/shortcuts/BUILD.gn              |  5 ++++-
+ chrome/browser/shortcuts/platform_util_win.cc  |  3 ++-
+ .../chrome_pwa_launcher/BUILD.gn               |  2 ++
+ .../chrome_pwa_launcher_util.cc                |  3 ++-
+ chrome/chrome_proxy/BUILD.gn                   |  2 ++
+ chrome/chrome_proxy/chrome_proxy_main_win.cc   | 10 +++++-----
+ chrome/common/BUILD.gn                         |  3 +++
+ chrome/common/chrome_constants.cc              |  7 +++++++
+ chrome/elevation_service/BUILD.gn              |  1 +
+ chrome/installer/linux/BUILD.gn                | 12 ++++++------
+ chrome/installer/util/BUILD.gn                 |  1 +
+ chrome/installer/util/util_constants.cc        |  9 ++++++---
+ chrome/notification_helper/BUILD.gn            |  1 +
+ components/crash/core/app/BUILD.gn             |  7 +++++--
+ components/crash/core/app/crashpad_linux.cc    |  4 +++-
+ components/crash/core/app/crashpad_mac.mm      |  6 +++---
+ sandbox/linux/BUILD.gn                         |  2 ++
+ .../linux/suid/client/setuid_sandbox_host.cc   |  4 +++-
+ 22 files changed, 92 insertions(+), 31 deletions(-)
+
+diff --git a/build/BUILD.gn b/build/BUILD.gn
+index 95ceaf090e..812bfe2177 100644
+--- a/build/BUILD.gn
++++ b/build/BUILD.gn
+@@ -56,6 +56,24 @@ buildflag_header("branding_buildflags") {
+   flags += [ "ENABLE_BUILTIN_SEARCH_PROVIDER_ASSETS=$enable_builtin_search_provider_assets" ]
+ }
+ 
++buildflag_header("chrome_tool_names_buildflags") {
++  header = "chrome_tool_names_buildflags.h"
++  flags = [
++    "CHROME_CRASHPAD_HANDLER_NAME=\"${chrome_tool_prefix}_crashpad_handler\"",
++    "CHROME_SANDBOX_NAME=\"${chrome_tool_prefix}_sandbox\"",
++    "CHROME_SUID_SANDBOX_NAME=\"${chrome_tool_prefix}-sandbox\"",
++    "CHROME_MANAGEMENT_SERVICE_NAME=\"${chrome_tool_prefix}_management_service\"",
++    "CHROME_PROXY_FILENAME=\"${chrome_tool_prefix}_proxy.exe\"",
++    "CHROME_PROXY_FILENAME_WIDE=L\"${chrome_tool_prefix}_proxy.exe\"",
++    "CHROME_PWA_LAUNCHER_FILENAME=\"${chrome_tool_prefix}_pwa_launcher.exe\"",
++    "CHROME_PWA_LAUNCHER_FILENAME_WIDE=L\"${chrome_tool_prefix}_pwa_launcher.exe\"",
++    "CHROME_ELEVATION_SERVICE_FILENAME=\"${chrome_tool_prefix}_elevation_service.exe\"",
++    "CHROME_ELEVATION_SERVICE_FILENAME_WIDE=L\"${chrome_tool_prefix}_elevation_service.exe\"",
++    "CHROME_NOTIFICATION_HELPER_FILENAME=\"${chrome_tool_prefix}_notification_helper.exe\"",
++    "CHROME_NOTIFICATION_HELPER_FILENAME_WIDE=L\"${chrome_tool_prefix}_notification_helper.exe\"",
++  ]
++}
++
+ buildflag_header("blink_buildflags") {
+   header = "blink_buildflags.h"
+   flags = [ "USE_BLINK=$use_blink" ]
+diff --git a/build/config/BUILDCONFIG.gn b/build/config/BUILDCONFIG.gn
+index 0ba8bf3862..71fca0a1f4 100644
+--- a/build/config/BUILDCONFIG.gn
++++ b/build/config/BUILDCONFIG.gn
+@@ -226,6 +226,10 @@ if (is_afree && chrome_scheme != "") {
+ # feature; a value without is_afree=true is ignored. The build scripts print a
+ # warning when this happens.
+ chrome_executable_name_enabled = is_afree && chrome_executable_name != ""
++chrome_tool_prefix = "chrome"
++if (chrome_executable_name_enabled) {
++  chrome_tool_prefix = chrome_executable_name
++}
+ # is_afree add end
+ 
+ if (enable_strict_deps) {
+diff --git a/chrome/BUILD.gn b/chrome/BUILD.gn
+index 4ddd5c156e..1ff18476d0 100644
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -86,6 +86,10 @@ if (is_win) {
+   _chrome_output_name = "initialexe/$_chrome_target_name"
+ }
+ 
++if (is_mac || is_linux || is_chromeos) {
++  _chrome_crashpad_handler_name = "${chrome_tool_prefix}_crashpad_handler"
++}
++
+ if (is_mac) {
+   _chrome_app_name = chrome_product_full_name
+   if (chrome_executable_name_enabled) {
+@@ -487,8 +491,8 @@ if (is_win) {
+     outputs = [ "$root_out_dir/First Run" ]
+   }
+ } else if (is_mac) {
+-  chrome_helper_name = chrome_product_full_name + " Helper"
+-  chrome_framework_name = chrome_product_full_name + " Framework"
++  chrome_helper_name = _chrome_app_name + " Helper"
++  chrome_framework_name = _chrome_app_name + " Framework"
+   chrome_framework_version = chrome_version_full
+ 
+   verify_dynamic_libraries = !is_component_build && !is_asan && !is_ubsan_any
+@@ -888,7 +892,7 @@ if (is_win) {
+   compile_plist("chrome_helper_app_alerts_plist_strings") {
+     format = "binary1"
+     plist_templates = [ "app/helper-alerts-InfoPlist.strings" ]
+-    substitutions = [ "CHROMIUM_FULL_NAME=$chrome_product_full_name" ]
++    substitutions = [ "CHROMIUM_FULL_NAME=$_chrome_app_name" ]
+     output_name = "$target_gen_dir/helper_alerts_infoplist_strings/base.lproj/InfoPlist.strings"
+   }
+   bundle_data("chrome_helper_app_alerts_resources") {
+@@ -941,7 +945,7 @@ if (is_win) {
+   bundle_data("chrome_framework_helpers") {
+     sources = [
+       "$root_out_dir/app_mode_loader",
+-      "$root_out_dir/chrome_crashpad_handler",
++      "$root_out_dir/$_chrome_crashpad_handler_name",
+       "$root_out_dir/web_app_shortcut_copier",
+     ]
+ 
+@@ -1332,7 +1336,7 @@ if (is_win) {
+     # the list of _dsyms in :chrome_dsym_archive.
+     _chrome_symbols_sources = [
+       "$root_out_dir/$_chrome_app_name.app/Contents/MacOS/$_chrome_app_name",
+-      "$root_out_dir/chrome_crashpad_handler",
++      "$root_out_dir/$_chrome_crashpad_handler_name",
+       "$root_out_dir/libvk_swiftshader.dylib",
+       _framework_binary_path,
+     ]
+@@ -1406,7 +1410,7 @@ if (is_win) {
+       _dsyms = [
+         "$root_out_dir/$chrome_framework_name.dSYM",
+         "$root_out_dir/$_chrome_app_name.dSYM",
+-        "$root_out_dir/chrome_crashpad_handler.dSYM",
++        "$root_out_dir/$_chrome_crashpad_handler_name.dSYM",
+         "$root_out_dir/libvk_swiftshader.dylib.dSYM",
+       ]
+       if (build_with_internal_optimization_guide) {
+@@ -1760,7 +1764,7 @@ if (is_linux || is_chromeos) {
+       deps = [ ":chrome" ]
+     }
+     extract_symbols("chrome_crashpad_symbols") {
+-      binary = "$root_out_dir/chrome_crashpad_handler"
++      binary = "$root_out_dir/$_chrome_crashpad_handler_name"
+ 
+       if (current_cpu == "x86") {
+         # GYP used "ia32" so keep that naming for back-compat.
+diff --git a/chrome/browser/enterprise/connectors/device_trust/key_management/installer/management_service/BUILD.gn b/chrome/browser/enterprise/connectors/device_trust/key_management/installer/management_service/BUILD.gn
+index dcdff86957..8284c2603e 100644
+--- a/chrome/browser/enterprise/connectors/device_trust/key_management/installer/management_service/BUILD.gn
++++ b/chrome/browser/enterprise/connectors/device_trust/key_management/installer/management_service/BUILD.gn
+@@ -4,6 +4,7 @@
+ 
+ if (is_linux) {
+   executable("chrome_management_service") {
++    output_name = "${chrome_tool_prefix}_management_service"
+     configs += [ "//components/enterprise:extra_warnings" ]
+ 
+     sources = [ "chrome_management_service_main.cc" ]
+diff --git a/chrome/browser/shortcuts/BUILD.gn b/chrome/browser/shortcuts/BUILD.gn
+index 96c42f8b78..f1d813f23d 100644
+--- a/chrome/browser/shortcuts/BUILD.gn
++++ b/chrome/browser/shortcuts/BUILD.gn
+@@ -55,7 +55,10 @@ source_set("shortcuts") {
+       "platform_util_win.cc",
+       "shortcut_creator_win.cc",
+     ]
+-    deps += [ "//chrome/common:non_code_constants" ]
++    deps += [
++      "//build:chrome_tool_names_buildflags",
++      "//chrome/common:non_code_constants",
++    ]
+   }
+ 
+   friend = [
+diff --git a/chrome/browser/shortcuts/platform_util_win.cc b/chrome/browser/shortcuts/platform_util_win.cc
+index e5ff01aa7e..019d45e9d0 100644
+--- a/chrome/browser/shortcuts/platform_util_win.cc
++++ b/chrome/browser/shortcuts/platform_util_win.cc
+@@ -7,13 +7,14 @@
+ #include "base/check.h"
+ #include "base/files/file_path.h"
+ #include "base/path_service.h"
++#include "build/chrome_tool_names_buildflags.h"
+ 
+ namespace shortcuts {
+ 
+ namespace {
+ 
+ constexpr base::FilePath::CharType kChromeProxyExecutable[] =
+-    FILE_PATH_LITERAL("chrome_proxy.exe");
++    BUILDFLAG(CHROME_PROXY_FILENAME_WIDE);
+ 
+ }  // namespace
+ 
+diff --git a/chrome/browser/web_applications/chrome_pwa_launcher/BUILD.gn b/chrome/browser/web_applications/chrome_pwa_launcher/BUILD.gn
+index 8a2eca6075..0bee45eefc 100644
+--- a/chrome/browser/web_applications/chrome_pwa_launcher/BUILD.gn
++++ b/chrome/browser/web_applications/chrome_pwa_launcher/BUILD.gn
+@@ -12,6 +12,7 @@ process_version_rc_template("chrome_pwa_launcher_version") {
+ }
+ 
+ executable("chrome_pwa_launcher") {
++  output_name = "${chrome_tool_prefix}_pwa_launcher"
+   sources = [
+     "chrome_pwa_launcher_exe.rc",
+     "chrome_pwa_launcher_main.cc",
+@@ -54,6 +55,7 @@ source_set("util") {
+   public_deps = [ "//base" ]
+ 
+   deps = [
++    "//build:chrome_tool_names_buildflags",
+     "//chrome/common:non_code_constants",
+     "//chrome/installer/util:with_no_strings",
+     "//components/version_info:generate_version_info",
+diff --git a/chrome/browser/web_applications/chrome_pwa_launcher/chrome_pwa_launcher_util.cc b/chrome/browser/web_applications/chrome_pwa_launcher/chrome_pwa_launcher_util.cc
+index 1c12414f3c..fd1f34b53f 100644
+--- a/chrome/browser/web_applications/chrome_pwa_launcher/chrome_pwa_launcher_util.cc
++++ b/chrome/browser/web_applications/chrome_pwa_launcher/chrome_pwa_launcher_util.cc
+@@ -6,12 +6,13 @@
+ 
+ #include "base/files/file_util.h"
+ #include "base/path_service.h"
++#include "build/chrome_tool_names_buildflags.h"
+ #include "chrome/common/chrome_constants.h"
+ 
+ namespace {
+ 
+ constexpr base::FilePath::StringViewType kChromePwaLauncherExecutable =
+-    L"chrome_pwa_launcher.exe";
++    BUILDFLAG(CHROME_PWA_LAUNCHER_FILENAME_WIDE);
+ 
+ }  // namespace
+ 
+diff --git a/chrome/chrome_proxy/BUILD.gn b/chrome/chrome_proxy/BUILD.gn
+index fd19272039..39093c3c3b 100644
+--- a/chrome/chrome_proxy/BUILD.gn
++++ b/chrome/chrome_proxy/BUILD.gn
+@@ -12,9 +12,11 @@ process_version_rc_template("chrome_proxy_version") {
+ }
+ 
+ executable("chrome_proxy") {
++  output_name = "${chrome_tool_prefix}_proxy"
+   deps = [
+     ":chrome_proxy_version",
+     "//base",
++    "//build:chrome_tool_names_buildflags",
+     "//chrome/app/version_assembly:chrome_exe_manifest",
+     "//chrome/common:non_code_constants",
+   ]
+diff --git a/chrome/chrome_proxy/chrome_proxy_main_win.cc b/chrome/chrome_proxy/chrome_proxy_main_win.cc
+index 776f544e46..d779901c91 100644
+--- a/chrome/chrome_proxy/chrome_proxy_main_win.cc
++++ b/chrome/chrome_proxy/chrome_proxy_main_win.cc
+@@ -10,15 +10,14 @@
+ #include "base/logging/logging_settings.h"
+ #include "base/path_service.h"
+ #include "base/process/launch.h"
++#include "build/chrome_tool_names_buildflags.h"
++#include "chrome/common/chrome_constants.h"
+ #include "chrome/common/chrome_switches.h"
+ 
+ namespace {
+ 
+-constexpr base::FilePath::CharType kChromeExecutable[] =
+-    FILE_PATH_LITERAL("chrome.exe");
+-
+ constexpr base::FilePath::CharType kChromeProxyExecutable[] =
+-    FILE_PATH_LITERAL("chrome_proxy.exe");
++    BUILDFLAG(CHROME_PROXY_FILENAME_WIDE);
+ 
+ }  // namespace
+ 
+@@ -50,7 +49,8 @@ int WINAPI wWinMain(HINSTANCE instance,
+ 
+   base::FilePath chrome_dir;
+   CHECK(base::PathService::Get(base::DIR_EXE, &chrome_dir));
+-  base::CommandLine chrome_command_line(chrome_dir.Append(kChromeExecutable));
++  base::CommandLine chrome_command_line(
++      chrome_dir.Append(chrome::kBrowserProcessExecutableName));
+ 
+   // Forward all command line arguments.
+   const std::vector<std::wstring>& argv =
+diff --git a/chrome/common/BUILD.gn b/chrome/common/BUILD.gn
+index ff1cf1fa41..12f07fc705 100644
+--- a/chrome/common/BUILD.gn
++++ b/chrome/common/BUILD.gn
+@@ -51,6 +51,7 @@ if (chrome_executable_name_enabled) {
+ }
+ _chrome_executable_filename = "$_chrome_executable_name.exe"
+ _chrome_helper_executable_name = "$_chrome_executable_name Helper"
++_chrome_framework_name = "$_chrome_executable_name Framework"
+ _chrome_browser_executable_path =
+     "$_chrome_executable_name.app/Contents/MacOS/$_chrome_executable_name"
+ _chrome_helper_executable_path =
+@@ -65,6 +66,8 @@ buildflag_header("chrome_executable_name_buildflags") {
+     "CHROME_EXECUTABLE_NAME_WIDE=L\"$_chrome_executable_name\"",
+     "CHROME_EXECUTABLE_FILENAME_WIDE=L\"$_chrome_executable_filename\"",
+     "CHROME_HELPER_EXECUTABLE_NAME=\"$_chrome_helper_executable_name\"",
++    "CHROME_FRAMEWORK_NAME=\"$_chrome_framework_name\"",
++    "CHROME_FRAMEWORK_BUNDLE_NAME=\"$_chrome_framework_name.framework\"",
+     "CHROME_BROWSER_EXECUTABLE_PATH=\"$_chrome_browser_executable_path\"",
+     "CHROME_HELPER_EXECUTABLE_PATH=\"$_chrome_helper_executable_path\"",
+   ]
+diff --git a/chrome/common/chrome_constants.cc b/chrome/common/chrome_constants.cc
+index 6a5100a9f7..7c8275dc06 100644
+--- a/chrome/common/chrome_constants.cc
++++ b/chrome/common/chrome_constants.cc
+@@ -124,10 +124,17 @@ const base::FilePath::CharType kHelperProcessExecutablePath[] = FPL("chrome");
+ #endif  // OS_*
+ 
+ #if BUILDFLAG(IS_MAC)
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++const base::FilePath::CharType kFrameworkName[] =
++    BUILDFLAG(CHROME_FRAMEWORK_BUNDLE_NAME);
++const base::FilePath::CharType kFrameworkExecutableName[] =
++    BUILDFLAG(CHROME_FRAMEWORK_NAME);
++#else
+ const base::FilePath::CharType kFrameworkName[] =
+     FPL(PRODUCT_FULLNAME_STRING " Framework.framework");
+ const base::FilePath::CharType kFrameworkExecutableName[] =
+     FPL(PRODUCT_FULLNAME_STRING " Framework");
++#endif
+ const char kMacHelperSuffixAlerts[] = " (Alerts)";
+ #endif  // BUILDFLAG(IS_MAC)
+ 
+diff --git a/chrome/elevation_service/BUILD.gn b/chrome/elevation_service/BUILD.gn
+index 0ce72b243f..2d7b251264 100644
+--- a/chrome/elevation_service/BUILD.gn
++++ b/chrome/elevation_service/BUILD.gn
+@@ -16,6 +16,7 @@ midl("elevation_service_idl") {
+ }
+ 
+ executable("elevation_service") {
++  output_name = "${chrome_tool_prefix}_elevation_service"
+   sources = [
+     "elevation_service.cc",
+     "elevation_service.rc",
+diff --git a/chrome/installer/linux/BUILD.gn b/chrome/installer/linux/BUILD.gn
+index 4e67953a1c..028f99c9bf 100644
+--- a/chrome/installer/linux/BUILD.gn
++++ b/chrome/installer/linux/BUILD.gn
+@@ -66,9 +66,9 @@ if (chrome_executable_name_enabled) {
+ 
+ packaging_files_executables = [
+   "$root_out_dir/$_chrome_binary_name",
+-  "$root_out_dir/chrome_crashpad_handler",
+-  "$root_out_dir/chrome_management_service",
+-  "$root_out_dir/chrome_sandbox",
++  "$root_out_dir/${chrome_tool_prefix}_crashpad_handler",
++  "$root_out_dir/${chrome_tool_prefix}_management_service",
++  "$root_out_dir/${chrome_tool_prefix}_sandbox",
+ ]
+ 
+ packaging_files_shlibs = []
+@@ -208,17 +208,17 @@ strip_binary("strip_chrome_binary") {
+ }
+ 
+ strip_binary("strip_chrome_crashpad_handler") {
+-  binary_input = "$root_out_dir/chrome_crashpad_handler"
++  binary_input = "$root_out_dir/${chrome_tool_prefix}_crashpad_handler"
+   deps = [ "//components/crash/core/app:chrome_crashpad_handler" ]
+ }
+ 
+ strip_binary("strip_chrome_management_service") {
+-  binary_input = "$root_out_dir/chrome_management_service"
++  binary_input = "$root_out_dir/${chrome_tool_prefix}_management_service"
+   deps = [ "//chrome/browser/enterprise/connectors/device_trust/key_management/installer/management_service:chrome_management_service" ]
+ }
+ 
+ strip_binary("strip_chrome_sandbox") {
+-  binary_input = "$root_out_dir/chrome_sandbox"
++  binary_input = "$root_out_dir/${chrome_tool_prefix}_sandbox"
+   deps = [ "//sandbox/linux:chrome_sandbox" ]
+ }
+ 
+diff --git a/chrome/installer/util/BUILD.gn b/chrome/installer/util/BUILD.gn
+index 4c37f697b7..3fd641d6fa 100644
+--- a/chrome/installer/util/BUILD.gn
++++ b/chrome/installer/util/BUILD.gn
+@@ -269,6 +269,7 @@ source_set("constants") {
+       "util_constants.cc",
+     ]
+ 
++    deps = [ "//build:chrome_tool_names_buildflags" ]
+     public_deps = [ "//base" ]
+   }
+ }
+diff --git a/chrome/installer/util/util_constants.cc b/chrome/installer/util/util_constants.cc
+index fa3e16293f..8a81050f3e 100644
+--- a/chrome/installer/util/util_constants.cc
++++ b/chrome/installer/util/util_constants.cc
+@@ -4,6 +4,8 @@
+ 
+ #include "chrome/installer/util/util_constants.h"
+ 
++#include "build/chrome_tool_names_buildflags.h"
++
+ namespace installer {
+ 
+ namespace switches {
+@@ -182,7 +184,7 @@ const wchar_t kChromeDll[] = L"chrome.dll";
+ const wchar_t kChromeExe[] = L"chrome.exe";
+ const wchar_t kChromeNewExe[] = L"new_chrome.exe";
+ const wchar_t kChromeOldExe[] = L"old_chrome.exe";
+-const wchar_t kChromeProxyExe[] = L"chrome_proxy.exe";
++const wchar_t kChromeProxyExe[] = BUILDFLAG(CHROME_PROXY_FILENAME_WIDE);
+ const wchar_t kChromeProxyNewExe[] = L"new_chrome_proxy.exe";
+ const wchar_t kChromeProxyOldExe[] = L"old_chrome_proxy.exe";
+ const wchar_t kCmdAlternateRenameChromeExe[] = L"rename-chrome-exe";
+@@ -202,7 +204,8 @@ const wchar_t kInstallBinaryDir[] = L"Application";
+ const wchar_t kInstallerDir[] = L"Installer";
+ const wchar_t kInstallTempDir[] = L"Temp";
+ const wchar_t kLnkExt[] = L".lnk";
+-const wchar_t kNotificationHelperExe[] = L"notification_helper.exe";
++const wchar_t kNotificationHelperExe[] =
++    BUILDFLAG(CHROME_NOTIFICATION_HELPER_FILENAME_WIDE);
+ const wchar_t kWerDll[] = L"chrome_wer.dll";
+ 
+ // DowngradeVersion holds the version from which Chrome was downgraded. In case
+@@ -219,7 +222,7 @@ const wchar_t kUninstallInstallationDate[] = L"installation_date";
+ 
+ // Elevation Service constants.
+ const base::FilePath::CharType kElevationServiceExe[] =
+-    FILE_PATH_LITERAL("elevation_service.exe");
++    BUILDFLAG(CHROME_ELEVATION_SERVICE_FILENAME_WIDE);
+ 
+ // Google Update installer result API.
+ const wchar_t kInstallerError[] = L"InstallerError";
+diff --git a/chrome/notification_helper/BUILD.gn b/chrome/notification_helper/BUILD.gn
+index 0244dc319f..07c05e63c3 100644
+--- a/chrome/notification_helper/BUILD.gn
++++ b/chrome/notification_helper/BUILD.gn
+@@ -8,6 +8,7 @@ import("//chrome/process_version_rc_template.gni")
+ import("//testing/test.gni")
+ 
+ executable("notification_helper") {
++  output_name = "${chrome_tool_prefix}_notification_helper"
+   sources = [
+     "notification_helper.cc",
+     "notification_helper.rc",
+diff --git a/components/crash/core/app/BUILD.gn b/components/crash/core/app/BUILD.gn
+index b25d2303fd..9cd00303fe 100644
+--- a/components/crash/core/app/BUILD.gn
++++ b/components/crash/core/app/BUILD.gn
+@@ -78,6 +78,7 @@ static_library("app") {
+   deps = [
+     "//base",
+     "//build:branding_buildflags",
++    "//build:chrome_tool_names_buildflags",
+     "//build:chromeos_buildflags",
+     "//components/crash/core/common:crash_key",
+     "//content/public/common:content_descriptors",
+@@ -242,6 +243,7 @@ if (is_mac || is_android || is_linux || is_chromeos) {
+   # We build a chromium-specific crashpad_handler executable so that we can
+   # define custom UserStreamDataSources.
+   executable("chrome_crashpad_handler") {
++    output_name = "${chrome_tool_prefix}_crashpad_handler"
+     sources = [ "chrome_crashpad_handler.cc" ]
+ 
+     deps = [
+@@ -283,9 +285,10 @@ if (is_android) {
+   copy("chrome_crashpad_handler_named_as_so") {
+     deps = [ ":chrome_crashpad_handler" ]
+ 
+-    sources = [ "$root_out_dir/chrome_crashpad_handler" ]
++    sources = [ "$root_out_dir/${chrome_tool_prefix}_crashpad_handler" ]
+ 
+-    outputs = [ "$root_out_dir/libchrome_crashpad_handler.so" ]
++    outputs =
++        [ "$root_out_dir/lib${chrome_tool_prefix}_crashpad_handler.so" ]
+   }
+ }
+ 
+diff --git a/components/crash/core/app/crashpad_linux.cc b/components/crash/core/app/crashpad_linux.cc
+index d4d3555891..84c4622641 100644
+--- a/components/crash/core/app/crashpad_linux.cc
++++ b/components/crash/core/app/crashpad_linux.cc
+@@ -19,6 +19,7 @@
+ #include "base/strings/stringprintf.h"
+ #include "base/system/sys_info.h"
+ #include "build/branding_buildflags.h"
++#include "build/chrome_tool_names_buildflags.h"
+ #include "build/chromeos_buildflags.h"
+ #include "components/crash/core/app/crash_reporter_client.h"
+ #include "components/crash/core/app/crash_switches.h"
+@@ -169,7 +170,8 @@ bool PlatformCrashpadInitialization(
+     if (!base::PathService::Get(base::DIR_EXE, &handler_path)) {
+       return false;
+     }
+-    handler_path = handler_path.Append("chrome_crashpad_handler");
++    handler_path =
++        handler_path.Append(BUILDFLAG(CHROME_CRASHPAD_HANDLER_NAME));
+ 
+     // When --use-cros-crash-reporter is set (below), the handler passes dumps
+     // to ChromeOS's /sbin/crash_reporter which in turn passes the dump to
+diff --git a/components/crash/core/app/crashpad_mac.mm b/components/crash/core/app/crashpad_mac.mm
+index 3b131e1fc8..96c9656ed0 100644
+--- a/components/crash/core/app/crashpad_mac.mm
++++ b/components/crash/core/app/crashpad_mac.mm
+@@ -20,6 +20,7 @@
+ #include "base/strings/string_number_conversions.h"
+ #include "base/strings/sys_string_conversions.h"
+ #include "build/branding_buildflags.h"
++#include "build/chrome_tool_names_buildflags.h"
+ #include "components/crash/core/app/crash_reporter_client.h"
+ #include "third_party/crashpad/crashpad/client/crash_report_database.h"
+ #include "third_party/crashpad/crashpad/client/crashpad_client.h"
+@@ -146,9 +147,8 @@ bool PlatformCrashpadInitialization(
+   if (initial_client) {
+     @autoreleasepool {
+       base::FilePath framework_bundle_path = base::apple::FrameworkBundlePath();
+-      base::FilePath handler_path =
+-          framework_bundle_path.Append("Helpers").Append(
+-              "chrome_crashpad_handler");
++      base::FilePath handler_path = framework_bundle_path.Append("Helpers").Append(
++          BUILDFLAG(CHROME_CRASHPAD_HANDLER_NAME));
+ 
+       // Is there a way to recover if this fails?
+       CrashReporterClient* crash_reporter_client = GetCrashReporterClient();
+diff --git a/sandbox/linux/BUILD.gn b/sandbox/linux/BUILD.gn
+index 1fe96111ce..c96d540b61 100644
+--- a/sandbox/linux/BUILD.gn
++++ b/sandbox/linux/BUILD.gn
+@@ -291,6 +291,7 @@ if (is_android) {
+ if (is_linux || is_chromeos) {
+   # The setuid sandbox for Linux.
+   executable("chrome_sandbox") {
++    output_name = "${chrome_tool_prefix}_sandbox"
+     sources = [
+       "suid/common/sandbox.h",
+       "suid/common/suid_unsafe_environment_variables.h",
+@@ -413,6 +414,7 @@ if (compile_suid_client) {
+     deps = [
+       ":sandbox_services",
+       "//base",
++      "//build:chrome_tool_names_buildflags",
+     ]
+   }
+ }
+diff --git a/sandbox/linux/suid/client/setuid_sandbox_host.cc b/sandbox/linux/suid/client/setuid_sandbox_host.cc
+index 5303cafbb3..3b27e701e4 100644
+--- a/sandbox/linux/suid/client/setuid_sandbox_host.cc
++++ b/sandbox/linux/suid/client/setuid_sandbox_host.cc
+@@ -21,6 +21,7 @@
+ #include "base/environment.h"
+ #include "base/files/file_path.h"
+ #include "base/files/file_util.h"
++#include "build/chrome_tool_names_buildflags.h"
+ #include "base/files/scoped_file.h"
+ #include "base/logging.h"
+ #include "base/memory/ptr_util.h"
+@@ -129,7 +130,8 @@ base::FilePath SetuidSandboxHost::GetSandboxBinaryPath() {
+   base::FilePath sandbox_binary;
+   base::FilePath exe_dir;
+   if (base::PathService::Get(base::DIR_EXE, &exe_dir)) {
+-    base::FilePath sandbox_candidate = exe_dir.AppendASCII("chrome-sandbox");
++    base::FilePath sandbox_candidate =
++        exe_dir.AppendASCII(BUILDFLAG(CHROME_SUID_SANDBOX_NAME));
+     if (base::PathExists(sandbox_candidate))
+       sandbox_binary = sandbox_candidate;
+   }
+-- 
+2.56.1
+

@@ -1,0 +1,807 @@
+From 5a69db2dfd82b9dbf3747a64f5150d3e2839a59f Mon Sep 17 00:00:00 2001
+From: "5455945@gmail.com" <5455945@gmail.com>
+Date: Tue, 24 Nov 2026 10:55:15 +0800
+Subject: [PATCH 3/3] afree: rename DLLs and installer packaging (patch 3/3)
+
+---
+ build/BUILD.gn                                | 30 ++++++++++++
+ build/config/BUILDCONFIG.gn                   | 12 +++++
+ build/win/reorder-imports.py                  | 16 +++---
+ build/win/rewrite_def.py                      | 24 +++++++++
+ chrome/BUILD.gn                               |  7 +--
+ chrome/app/version_assembly/BUILD.gn          |  2 +
+ .../version_assembly_manifest.template        |  2 +-
+ .../os_integration/mac/BUILD.gn               |  7 ++-
+ chrome/chrome_elf/BUILD.gn                    | 15 +++++-
+ chrome/common/BUILD.gn                        |  1 +
+ chrome/common/chrome_constants.cc             |  7 ++-
+ chrome/installer/linux/BUILD.gn               |  4 ++
+ chrome/installer/linux/common/installer.py    | 21 +++++---
+ .../installer/linux/common/postinst.include   |  4 +-
+ chrome/installer/mac/BUILD.gn                 |  6 ++-
+ chrome/installer/mini_installer/BUILD.gn      | 41 ++++++++++++----
+ .../mini_installer/mini_installer.cc          | 19 ++++---
+ .../mini_installer_constants.cc               |  7 +--
+ chrome/installer/setup/BUILD.gn               |  1 +
+ chrome/installer/util/util_constants.cc       | 21 ++++----
+ .../build/win/create_installer_archive.py     | 49 ++++++++++++++++++-
+ components/crash/win/BUILD.gn                 |  1 +
+ 22 files changed, 242 insertions(+), 55 deletions(-)
+ create mode 100644 build/win/rewrite_def.py
+
+diff --git a/build/BUILD.gn b/build/BUILD.gn
+index 812bfe2177..918c43aa53 100644
+--- a/build/BUILD.gn
++++ b/build/BUILD.gn
+@@ -71,6 +71,36 @@ buildflag_header("chrome_tool_names_buildflags") {
+     "CHROME_ELEVATION_SERVICE_FILENAME_WIDE=L\"${chrome_tool_prefix}_elevation_service.exe\"",
+     "CHROME_NOTIFICATION_HELPER_FILENAME=\"${chrome_tool_prefix}_notification_helper.exe\"",
+     "CHROME_NOTIFICATION_HELPER_FILENAME_WIDE=L\"${chrome_tool_prefix}_notification_helper.exe\"",
++    "CHROME_MAIN_EXE_FILENAME=\"${chrome_tool_prefix}.exe\"",
++    "CHROME_MAIN_EXE_FILENAME_WIDE=L\"${chrome_tool_prefix}.exe\"",
++    "CHROME_NEW_MAIN_EXE_FILENAME=\"new_${chrome_tool_prefix}.exe\"",
++    "CHROME_NEW_MAIN_EXE_FILENAME_WIDE=L\"new_${chrome_tool_prefix}.exe\"",
++    "CHROME_OLD_MAIN_EXE_FILENAME=\"old_${chrome_tool_prefix}.exe\"",
++    "CHROME_OLD_MAIN_EXE_FILENAME_WIDE=L\"old_${chrome_tool_prefix}.exe\"",
++    "CHROME_PROXY_NEW_FILENAME=\"new_${chrome_tool_prefix}_proxy.exe\"",
++    "CHROME_PROXY_NEW_FILENAME_WIDE=L\"new_${chrome_tool_prefix}_proxy.exe\"",
++    "CHROME_PROXY_OLD_FILENAME=\"old_${chrome_tool_prefix}_proxy.exe\"",
++    "CHROME_PROXY_OLD_FILENAME_WIDE=L\"old_${chrome_tool_prefix}_proxy.exe\"",
++    "CHROME_DLL_FILENAME=\"${chrome_dll_base}.dll\"",
++    "CHROME_DLL_FILENAME_WIDE=L\"${chrome_dll_base}.dll\"",
++    "CHROME_ELF_DLL_FILENAME=\"${chrome_elf_dll_base}.dll\"",
++    "CHROME_ELF_DLL_FILENAME_WIDE=L\"${chrome_elf_dll_base}.dll\"",
++    "CHROME_WER_DLL_FILENAME=\"${chrome_wer_dll_base}.dll\"",
++    "CHROME_WER_DLL_FILENAME_WIDE=L\"${chrome_wer_dll_base}.dll\"",
++    "CHROME_SETUP_FILENAME=\"${chrome_setup_base}.exe\"",
++    "CHROME_SETUP_FILENAME_WIDE=L\"${chrome_setup_base}.exe\"",
++    "CHROME_MINI_INSTALLER_FILENAME=\"${chrome_mini_installer_base}.exe\"",
++    "CHROME_MINI_INSTALLER_FILENAME_WIDE=L\"${chrome_mini_installer_base}.exe\"",
++    "CHROME_ARCHIVE_FILENAME=\"${chrome_archive_base}.7z\"",
++    "CHROME_ARCHIVE_FILENAME_WIDE=L\"${chrome_archive_base}.7z\"",
++    "CHROME_PACKED_ARCHIVE_FILENAME=\"${chrome_archive_base}.packed.7z\"",
++    "CHROME_PACKED_ARCHIVE_FILENAME_WIDE=L\"${chrome_archive_base}.packed.7z\"",
++    "CHROME_ARCHIVE_PREFIX=\"${chrome_archive_base}\"",
++    "CHROME_ARCHIVE_PREFIX_WIDE=L\"${chrome_archive_base}\"",
++    "CHROME_SETUP_PREFIX=\"${chrome_setup_base}\"",
++    "CHROME_SETUP_PREFIX_WIDE=L\"${chrome_setup_base}\"",
++    "CHROME_ACTIVE_SETUP_FILENAME=\"${chrome_tool_prefix}stp.exe\"",
++    "CHROME_ACTIVE_SETUP_FILENAME_WIDE=L\"${chrome_tool_prefix}stp.exe\"",
+   ]
+ }
+ 
+diff --git a/build/config/BUILDCONFIG.gn b/build/config/BUILDCONFIG.gn
+index 71fca0a1f4..a00d5b4985 100644
+--- a/build/config/BUILDCONFIG.gn
++++ b/build/config/BUILDCONFIG.gn
+@@ -227,8 +227,20 @@ if (is_afree && chrome_scheme != "") {
+ # warning when this happens.
+ chrome_executable_name_enabled = is_afree && chrome_executable_name != ""
+ chrome_tool_prefix = "chrome"
++chrome_dll_base = "chrome"
++chrome_elf_dll_base = "chrome_elf"
++chrome_wer_dll_base = "chrome_wer"
++chrome_setup_base = "setup"
++chrome_mini_installer_base = "mini_installer"
++chrome_archive_base = "chrome"
+ if (chrome_executable_name_enabled) {
+   chrome_tool_prefix = chrome_executable_name
++  chrome_dll_base = chrome_executable_name
++  chrome_elf_dll_base = "${chrome_executable_name}_elf"
++  chrome_wer_dll_base = "${chrome_executable_name}_wer"
++  chrome_setup_base = "${chrome_executable_name}_setup"
++  chrome_mini_installer_base = "${chrome_executable_name}_mini_installer"
++  chrome_archive_base = chrome_executable_name
+ }
+ # is_afree add end
+ 
+diff --git a/build/win/reorder-imports.py b/build/win/reorder-imports.py
+index 9dc2fb19ec..30868d749e 100755
+--- a/build/win/reorder-imports.py
++++ b/build/win/reorder-imports.py
+@@ -15,7 +15,8 @@ sys.path.insert(
+                  'pefile_py3'))
+ import pefile
+ 
+-def reorder_imports(input_dir, output_dir, architecture, exe_name='chrome'):
++def reorder_imports(input_dir, output_dir, architecture, exe_name='chrome',
++                    elf_name='chrome_elf.dll'):
+   """Swap chrome_elf.dll to be the first import of the browser executable.
+   Also copy over any related files that might be needed
+   (pdbs, manifests etc.).
+@@ -47,8 +48,8 @@ def reorder_imports(input_dir, output_dir, architecture, exe_name='chrome'):
+ 
+   found_elf = False
+   for i, peimport in enumerate(pe.DIRECTORY_ENTRY_IMPORT):
+-    if peimport.dll.lower() == b'chrome_elf.dll':
+-      assert not found_elf, 'only one chrome_elf.dll import expected'
++    if peimport.dll.lower() == elf_name.encode().lower():
++      assert not found_elf, 'only one %s import expected' % elf_name
+       found_elf = True
+       if i > 0:
+         swap = pe.DIRECTORY_ENTRY_IMPORT[0]
+@@ -69,7 +70,7 @@ def reorder_imports(input_dir, output_dir, architecture, exe_name='chrome'):
+             swap.struct.Name, peimport.struct.Name
+         peimport.struct.FirstThunk, swap.struct.FirstThunk = \
+             swap.struct.FirstThunk, peimport.struct.FirstThunk
+-  assert found_elf, 'chrome_elf.dll import not found'
++  assert found_elf, '%s import not found' % elf_name
+ 
+   pe.write(filename=output_image)
+ 
+@@ -80,7 +81,7 @@ def reorder_imports(input_dir, output_dir, architecture, exe_name='chrome'):
+ 
+ def main(argv):
+   usage = ('reorder_imports.py -i <input_dir> -o <output_dir> '
+-           '-a <target_arch> [-n <exe_name>]')
++           '-a <target_arch> [-n <exe_name>] [-e <elf_name>]')
+   parser = optparse.OptionParser(usage=usage)
+   parser.add_option('-i', '--input', help='reorder browser exe in DIR',
+       metavar='DIR')
+@@ -90,11 +91,14 @@ def main(argv):
+       default='ia32')
+   parser.add_option('-n', '--exe-name', help='executable basename',
+       default='chrome', metavar='NAME')
++  parser.add_option('-e', '--elf-name', help='chrome elf dll name',
++      default='chrome_elf.dll', metavar='NAME')
+   opts, args = parser.parse_args()
+ 
+   if not opts.input or not opts.output:
+     parser.error('Please provide and input and output directory')
+-  return reorder_imports(opts.input, opts.output, opts.arch, opts.exe_name)
++  return reorder_imports(opts.input, opts.output, opts.arch, opts.exe_name,
++                         opts.elf_name)
+ 
+ if __name__ == "__main__":
+   sys.exit(main(sys.argv[1:]))
+diff --git a/build/win/rewrite_def.py b/build/win/rewrite_def.py
+new file mode 100644
+index 0000000000..80e7efafb7
+--- /dev/null
++++ b/build/win/rewrite_def.py
+@@ -0,0 +1,24 @@
++#!/usr/bin/env python3
++# Copyright 2026 The Chromium Authors
++# Use of this source code is governed by a BSD-style license that can be
++# found in the LICENSE file.
++"""Rewrites the LIBRARY name in a Windows .def file."""
++
++import sys
++
++
++def main(argv):
++  if len(argv) != 3:
++    print('usage: rewrite_def.py <input.def> <output.def> <library_name>')
++    return 1
++  input_path, output_path, library_name = argv
++  with open(input_path, 'r') as f:
++    contents = f.read()
++  contents = contents.replace('chrome_elf.dll', library_name)
++  with open(output_path, 'w') as f:
++    f.write(contents)
++  return 0
++
++
++if __name__ == '__main__':
++  sys.exit(main(sys.argv[1:]))
+diff --git a/chrome/BUILD.gn b/chrome/BUILD.gn
+index 1ff18476d0..db4b1ad2dd 100644
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -124,6 +124,8 @@ if (is_win) {
+       current_cpu,
+       "-n",
+       _chrome_target_name,
++      "-e",
++      "${chrome_elf_dll_base}.dll",
+     ]
+     deps = [ ":chrome_initial" ]
+   }
+@@ -426,6 +428,7 @@ if (!is_android && !is_mac) {
+ 
+ if (is_win) {
+   shared_library("chrome_dll") {
++    output_name = chrome_dll_base
+     configs += [ "//build/config/compiler:wexit_time_destructors" ]
+     configs -= [ "//build/config/compiler:thinlto_optimize_default" ]
+     configs += [ "//build/config/compiler:thinlto_optimize_max" ]
+@@ -441,8 +444,6 @@ if (is_win) {
+       "app/startup_timestamps.h",
+     ]
+ 
+-    output_name = "chrome"
+-
+     deps = [
+       ":chrome_dll_manifest",
+       ":chrome_dll_version",
+@@ -1720,7 +1721,7 @@ if (is_android) {
+ if (is_win && enable_resource_allowlist_generation) {
+   generate_resource_allowlist("resource_allowlist") {
+     deps = [ ":chrome_dll" ]
+-    inputs = [ "$root_out_dir/chrome.dll.pdb" ]
++    inputs = [ "$root_out_dir/${chrome_dll_base}.dll.pdb" ]
+     output = _chrome_resource_allowlist
+   }
+ }
+diff --git a/chrome/app/version_assembly/BUILD.gn b/chrome/app/version_assembly/BUILD.gn
+index fe7d487571..8bf559c88c 100644
+--- a/chrome/app/version_assembly/BUILD.gn
++++ b/chrome/app/version_assembly/BUILD.gn
+@@ -39,6 +39,8 @@ windows_manifest("chrome_exe_manifest") {
+ # directory where Chrome finds chrome.dll.
+ process_version("version_assembly_manifest") {
+   template_file = "version_assembly_manifest.template"
++  extra_args =
++      [ "-e", "CHROME_ELF_DLL=\"${chrome_elf_dll_base}.dll\"" ]
+   sources = [ "//chrome/VERSION" ]
+   output = "$root_build_dir/$chrome_version_full.manifest"
+   process_only = true
+diff --git a/chrome/app/version_assembly/version_assembly_manifest.template b/chrome/app/version_assembly/version_assembly_manifest.template
+index 9bd1fc58f9..44960c839e 100644
+--- a/chrome/app/version_assembly/version_assembly_manifest.template
++++ b/chrome/app/version_assembly/version_assembly_manifest.template
+@@ -4,5 +4,5 @@
+       name='@MAJOR@.@MINOR@.@BUILD@.@PATCH@'
+       version='@MAJOR@.@MINOR@.@BUILD@.@PATCH@'
+       type='win32'/>
+-  <file name='chrome_elf.dll'/>
++  <file name='@CHROME_ELF_DLL@'/>
+ </assembly>
+diff --git a/chrome/browser/web_applications/os_integration/mac/BUILD.gn b/chrome/browser/web_applications/os_integration/mac/BUILD.gn
+index 16a0aeeaa6..a7a6fc7541 100644
+--- a/chrome/browser/web_applications/os_integration/mac/BUILD.gn
++++ b/chrome/browser/web_applications/os_integration/mac/BUILD.gn
+@@ -6,6 +6,11 @@ import("//build/config/sanitizers/sanitizers.gni")
+ import("//build/util/branding.gni")
+ import("//chrome/version.gni")
+ 
++_chrome_app_name = chrome_product_full_name
++if (chrome_executable_name_enabled) {
++  _chrome_app_name = chrome_executable_name
++}
++
+ source_set("web_app_shortcut_copier_lib") {
+   sources = [ "web_app_shortcut_copier_mac.mm" ]
+ 
+@@ -42,7 +47,7 @@ executable("web_app_shortcut_copier") {
+       # The helper is a standalone tool rather than a bundled app so the
+       # framework's install name does not work as-is. Rewrite it so the
+       # relative path is correct given the executable's location.
+-      "-Wcrl,installnametool,-change,@executable_path/../Frameworks/${chrome_product_full_name} Framework.framework/Versions/${chrome_version_full}/${chrome_product_full_name} Framework,@executable_path/../${chrome_product_full_name} Framework",
++      "-Wcrl,installnametool,-change,@executable_path/../Frameworks/${_chrome_app_name} Framework.framework/Versions/${chrome_version_full}/${_chrome_app_name} Framework,@executable_path/../${_chrome_app_name} Framework",
+     ]
+ 
+     if (is_asan || is_ubsan_any) {
+diff --git a/chrome/chrome_elf/BUILD.gn b/chrome/chrome_elf/BUILD.gn
+index 0e3bd558ba..9ff6f37610 100644
+--- a/chrome/chrome_elf/BUILD.gn
++++ b/chrome/chrome_elf/BUILD.gn
+@@ -48,14 +48,27 @@ static_library("test_stubs") {
+   ]
+ }
+ 
++action("chrome_elf_def") {
++  script = "//build/win/rewrite_def.py"
++  inputs = [ "chrome_elf.def" ]
++  outputs = [ "$target_gen_dir/chrome_elf.def" ]
++  args = [
++    rebase_path("chrome_elf.def", root_build_dir),
++    rebase_path("$target_gen_dir/chrome_elf.def", root_build_dir),
++    "${chrome_elf_dll_base}.dll",
++  ]
++}
++
+ shared_library("chrome_elf") {
++  output_name = chrome_elf_dll_base
+   sources = [
+-    "chrome_elf.def",
++    "$target_gen_dir/chrome_elf.def",
+     "chrome_elf_main.cc",
+     "chrome_elf_main.h",
+   ]
+ 
+   deps = [
++    ":chrome_elf_def",
+     ":chrome_elf_manifest",
+     ":chrome_elf_resources",
+     ":crash",
+diff --git a/chrome/common/BUILD.gn b/chrome/common/BUILD.gn
+index 12f07fc705..af8d4f3c7b 100644
+--- a/chrome/common/BUILD.gn
++++ b/chrome/common/BUILD.gn
+@@ -484,6 +484,7 @@ static_library("non_code_constants") {
+     ":chrome_executable_name_buildflags",
+     ":version_header",
+     "//base",
++    "//build:chrome_tool_names_buildflags",
+     "//content/public/common:buildflags",
+   ]
+ 
+diff --git a/chrome/common/chrome_constants.cc b/chrome/common/chrome_constants.cc
+index 7c8275dc06..aa91941f2c 100644
+--- a/chrome/common/chrome_constants.cc
++++ b/chrome/common/chrome_constants.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/common/chrome_constants.h"
+ 
+ #include "build/build_config.h"
++#include "build/chrome_tool_names_buildflags.h"
+ #include "chrome/common/chrome_executable_name_buildflags.h"
+ #include "chrome/common/chrome_version.h"
+ 
+@@ -139,8 +140,10 @@ const char kMacHelperSuffixAlerts[] = " (Alerts)";
+ #endif  // BUILDFLAG(IS_MAC)
+ 
+ #if BUILDFLAG(IS_WIN)
+-const base::FilePath::CharType kBrowserResourcesDll[] = FPL("chrome.dll");
+-const base::FilePath::CharType kElfDll[] = FPL("chrome_elf.dll");
++const base::FilePath::CharType kBrowserResourcesDll[] =
++    BUILDFLAG(CHROME_DLL_FILENAME_WIDE);
++const base::FilePath::CharType kElfDll[] =
++    BUILDFLAG(CHROME_ELF_DLL_FILENAME_WIDE);
+ const base::FilePath::CharType kStatusTrayWindowClass[] =
+     FPL("Chrome_StatusTrayWindow");
+ #endif  // BUILDFLAG(IS_WIN)
+diff --git a/chrome/installer/linux/BUILD.gn b/chrome/installer/linux/BUILD.gn
+index 028f99c9bf..3d4c3b2688 100644
+--- a/chrome/installer/linux/BUILD.gn
++++ b/chrome/installer/linux/BUILD.gn
+@@ -541,6 +541,8 @@ template("linux_package") {
+       target_os,
+       "--xz-nthreads",
+       "$linux_debian_pkg_xz_nthreads",
++      "--progname",
++      chrome_tool_prefix,
+     ]
+     if (is_official_build) {
+       args += [ "-f" ]
+@@ -573,6 +575,8 @@ template("linux_package") {
+         rebase_path(root_out_dir, root_build_dir),
+         "-t",
+         target_os,
++        "--progname",
++        chrome_tool_prefix,
+       ]
+       if (is_official_build) {
+         args += [ "-f" ]
+diff --git a/chrome/installer/linux/common/installer.py b/chrome/installer/linux/common/installer.py
+index a9bbec2818..80ae3465bd 100644
+--- a/chrome/installer/linux/common/installer.py
++++ b/chrome/installer/linux/common/installer.py
+@@ -83,6 +83,9 @@ def parse_common_args(
+     parser.add_argument(
+         "-o", "--output-dir", required=True, help="output directory")
+     parser.add_argument("-t", "--target-os", required=True, help="target os")
++    parser.add_argument(
++        "--progname",
++        help="Override the PROGNAME from the branding info file.")
+     return parser
+ 
+ 
+@@ -333,6 +336,9 @@ class InstallerConfig:
+                   output_dir: pathlib.Path) -> "InstallerConfig":
+         data = cls._load_branding_and_version(output_dir, args.branding,
+                                               args.channel)
++        progname_override = getattr(args, "progname", None)
++        if progname_override:
++            data["info_vars"]["PROGNAME"] = progname_override
+         data.update({
+             "arch": args.arch,
+             "target_os": args.target_os,
+@@ -454,19 +460,19 @@ class InstallerConfig:
+             ),
+             Artifact(
+                 f"{progname}_sandbox.stripped",
+-                "chrome-sandbox",
++                f"{progname}-sandbox",
+                 ArtifactType.BINARY,
+                 StandardPermissions.SANDBOX,
+             ),
+             Artifact(
+-                "chrome_crashpad_handler.stripped",
+-                "chrome_crashpad_handler",
++                f"{progname}_crashpad_handler.stripped",
++                f"{progname}_crashpad_handler",
+                 ArtifactType.BINARY,
+                 StandardPermissions.EXECUTABLE,
+             ),
+             Artifact(
+-                "chrome_management_service.stripped",
+-                "chrome-management-service",
++                f"{progname}_management_service.stripped",
++                f"{progname}-management-service",
+                 ArtifactType.BINARY,
+                 StandardPermissions.EXECUTABLE,
+             ),
+@@ -1123,9 +1129,10 @@ class Installer:
+                 except subprocess.CalledProcessError:
+                     file_type = ""
+ 
+-                if base_name == "chrome-management-service":
++                progname = self.config.info_vars["PROGNAME"]
++                if base_name == f"{progname}-management-service":
+                     expected_perms = StandardPermissions.EXECUTABLE
+-                elif base_name == "chrome-sandbox":
++                elif base_name == f"{progname}-sandbox":
+                     expected_perms = StandardPermissions.SANDBOX
+                 elif "shell script" in file_type:
+                     expected_perms = StandardPermissions.EXECUTABLE
+diff --git a/chrome/installer/linux/common/postinst.include b/chrome/installer/linux/common/postinst.include
+index d237a1affe..1a20923436 100644
+--- a/chrome/installer/linux/common/postinst.include
++++ b/chrome/installer/linux/common/postinst.include
+@@ -88,8 +88,8 @@ chrome_management_service_setup() {
+ 
+   getent group chromemgmt > /dev/null || groupadd chromemgmt
+ 
+-  chgrp chromemgmt "@@INSTALLDIR/chrome-management-service"
+-  chmod 2755 "@@INSTALLDIR/chrome-management-service"
++  chgrp chromemgmt "@@INSTALLDIR/@@PROGNAME@@-management-service"
++  chmod 2755 "@@INSTALLDIR/@@PROGNAME@@-management-service"
+ 
+   mkdir -p "@@ENROLLMENTDIR"
+   SIGNING_KEY_FILE="@@ENROLLMENTDIR/DeviceTrustSigningKey"
+diff --git a/chrome/installer/mac/BUILD.gn b/chrome/installer/mac/BUILD.gn
+index 9940fd294f..28bd5ecd21 100644
+--- a/chrome/installer/mac/BUILD.gn
++++ b/chrome/installer/mac/BUILD.gn
+@@ -22,7 +22,11 @@ group("mac") {
+   ]
+ }
+ 
+-_packaging_dir = "$root_out_dir/$chrome_product_full_name Packaging"
++_chrome_app_name = chrome_product_full_name
++if (chrome_executable_name_enabled) {
++  _chrome_app_name = chrome_executable_name
++}
++_packaging_dir = "$root_out_dir/$_chrome_app_name Packaging"
+ 
+ process_version_rc_template("sign_config") {
+   visibility = [ ":copy_signing" ]
+diff --git a/chrome/installer/mini_installer/BUILD.gn b/chrome/installer/mini_installer/BUILD.gn
+index b9a10dd067..a12a1b4247 100644
+--- a/chrome/installer/mini_installer/BUILD.gn
++++ b/chrome/installer/mini_installer/BUILD.gn
+@@ -68,7 +68,10 @@ source_set("lib") {
+     "write_to_disk.h",
+   ]
+ 
+-  deps = [ "//build:branding_buildflags" ]
++  deps = [
++    "//build:branding_buildflags",
++    "//build:chrome_tool_names_buildflags",
++  ]
+ 
+   # Initialization may insert unexpected memset calls.
+   configs -= [ "//build/config/compiler:default_init_stack_vars" ]
+@@ -143,6 +146,12 @@ _chrome_exe_name = "chrome"
+ if (chrome_executable_name_enabled) {
+   _chrome_exe_name = chrome_executable_name
+ }
++_chrome_dll_name = "${chrome_dll_base}.dll"
++_chrome_elf_name = "${chrome_elf_dll_base}.dll"
++_chrome_setup_name = "${chrome_setup_base}.exe"
++_chrome_archive_name = "${chrome_archive_base}.7z"
++_chrome_packed_archive_name = "${chrome_archive_base}.packed.7z"
++_chrome_setup_ex_name = "${chrome_setup_base}.ex_"
+ 
+ action("mini_installer_archive") {
+   script = "//chrome/tools/build/win/create_installer_archive.py"
+@@ -150,19 +159,19 @@ action("mini_installer_archive") {
+   release_file = "chrome.release"
+ 
+   inputs = [
+-    "$root_out_dir/chrome.dll",
+-    "$root_out_dir/chrome_elf.dll",
++    "$root_out_dir/$_chrome_dll_name",
++    "$root_out_dir/$_chrome_elf_name",
+     "$root_out_dir/$_chrome_exe_name.exe",
+     "$root_out_dir/locales/en-US.pak",
+-    "$root_out_dir/setup.exe",
++    "$root_out_dir/$_chrome_setup_name",
+     "//chrome/tools/build/win/makecab.py",
+     release_file,
+   ]
+ 
+   outputs = [
+-    "$root_out_dir/chrome.7z",
+-    "$root_out_dir/chrome.packed.7z",
+-    "$root_out_dir/setup.ex_",
++    "$root_out_dir/$_chrome_archive_name",
++    "$root_out_dir/$_chrome_packed_archive_name",
++    "$root_out_dir/$_chrome_setup_ex_name",
+     packed_files_rc_file,
+   ]
+   args = [
+@@ -178,6 +187,15 @@ action("mini_installer_archive") {
+     "--distribution=_${branding_path_product}",
+     "--output_dir",
+     rebase_path(root_out_dir, root_build_dir),
++    "--output_name=$chrome_archive_base",
++    "--chrome_exe_name=$_chrome_exe_name.exe",
++    "--chrome_dll_name=$_chrome_dll_name",
++    "--chrome_elf_name=$_chrome_elf_name",
++    "--chrome_proxy_name=${chrome_tool_prefix}_proxy.exe",
++    "--chrome_pwa_launcher_name=${chrome_tool_prefix}_pwa_launcher.exe",
++    "--chrome_wer_name=${chrome_wer_dll_base}.dll",
++    "--notification_helper_name=${chrome_tool_prefix}_notification_helper.exe",
++    "--setup_exe_name=$_chrome_setup_name",
+     "--chrome_runtime_deps",
+     rebase_path(chrome_runtime_deps, root_build_dir),
+     "--setup_runtime_deps",
+@@ -273,6 +291,9 @@ copy("copy_signing") {
+ # caller's `rc_file`.
+ template("generate_mini_installer") {
+   executable(target_name) {
++    if (defined(invoker.output_name)) {
++      output_name = invoker.output_name
++    }
+     sources = [ invoker.rc_file ]
+ 
+     # This target is special so we manually override most linker flags and
+@@ -326,11 +347,13 @@ template("generate_mini_installer") {
+ }
+ 
+ generate_mini_installer("mini_installer") {
++  output_name = chrome_mini_installer_base
+   rc_file = packed_files_rc_file
+ }
+ 
+ if (enable_uncompressed_archive) {
+   generate_mini_installer("mini_installer_uncompressed") {
++    output_name = "${chrome_mini_installer_base}_uncompressed"
+     rc_file = packed_files_rc_file_uncompressed
+   }
+ }
+@@ -358,14 +381,14 @@ if (!(is_component_build && is_debug && target_cpu == "x86") &&
+             root_out_dir)
+     inputs = [
+       "$root_out_dir/" + alternate_version_generator_rel_path,
+-      "$root_out_dir/mini_installer.exe",
++      "$root_out_dir/${chrome_mini_installer_base}.exe",
+     ]
+     outputs = [ "$root_out_dir/$target_name.exe" ]
+     args = [
+       "--alternate_version_generator",
+       alternate_version_generator_rel_path,
+       "--mini_installer",
+-      "mini_installer.exe",
++      "${chrome_mini_installer_base}.exe",
+       "--out",
+       "$target_name.exe",
+       "--path_7za",
+diff --git a/chrome/installer/mini_installer/mini_installer.cc b/chrome/installer/mini_installer/mini_installer.cc
+index 6aae112356..cb733e0e7b 100644
+--- a/chrome/installer/mini_installer/mini_installer.cc
++++ b/chrome/installer/mini_installer/mini_installer.cc
+@@ -280,26 +280,29 @@ class ChromeResourceDelegate : public ResourceEnumeratorDelegate {
+ // archive resources, or string overflow.
+ bool ChromeResourceDelegate::OnResource(const wchar_t* name,
+                                         const MemoryRange& data_range) {
+-  if (StrStartsWith(name, kChromeArchivePrefix)) {
+-    if (!archive_range_.empty()) {
++  // Check the setup prefix first. With a custom product name the archive
++  // prefix (e.g. "afree") can also be a prefix of the setup resource
++  // (e.g. "afree_setup.ex_"), so the more specific name must win.
++  if (StrStartsWith(name, kSetupPrefix)) {
++    if (!setup_range_.empty()) {
+       error_code_ = ERROR_TOO_MANY_NAMES;
+       return false;  // Break: duplicate resource name.
+     }
+-    if (!archive_name_.assign(name)) {
++    if (!setup_name_.assign(name)) {
+       error_code_ = ERROR_FILENAME_EXCED_RANGE;
+       return false;  // Break: resource name is too long.
+     }
+-    archive_range_ = data_range;
+-  } else if (StrStartsWith(name, kSetupPrefix)) {
+-    if (!setup_range_.empty()) {
++    setup_range_ = data_range;
++  } else if (StrStartsWith(name, kChromeArchivePrefix)) {
++    if (!archive_range_.empty()) {
+       error_code_ = ERROR_TOO_MANY_NAMES;
+       return false;  // Break: duplicate resource name.
+     }
+-    if (!setup_name_.assign(name)) {
++    if (!archive_name_.assign(name)) {
+       error_code_ = ERROR_FILENAME_EXCED_RANGE;
+       return false;  // Break: resource name is too long.
+     }
+-    setup_range_ = data_range;
++    archive_range_ = data_range;
+   } else {
+     error_code_ = ERROR_INVALID_DATA;
+     return false;  // Break: unexpected resource name.
+diff --git a/chrome/installer/mini_installer/mini_installer_constants.cc b/chrome/installer/mini_installer/mini_installer_constants.cc
+index c2a03ccbb6..423139b9ba 100644
+--- a/chrome/installer/mini_installer/mini_installer_constants.cc
++++ b/chrome/installer/mini_installer/mini_installer_constants.cc
+@@ -5,16 +5,17 @@
+ #include "chrome/installer/mini_installer/mini_installer_constants.h"
+ 
+ #include "build/branding_buildflags.h"
++#include "build/chrome_tool_names_buildflags.h"
+ 
+ namespace mini_installer {
+ 
+ // Various filenames and prefixes.
+ // The target name of the installer extracted from resources.
+-const wchar_t kSetupExe[] = L"setup.exe";
++const wchar_t kSetupExe[] = BUILDFLAG(CHROME_SETUP_FILENAME_WIDE);
+ // The prefix of the chrome archive resource.
+-const wchar_t kChromeArchivePrefix[] = L"chrome";
++const wchar_t kChromeArchivePrefix[] = BUILDFLAG(CHROME_ARCHIVE_PREFIX_WIDE);
+ // The prefix of the installer resource.
+-const wchar_t kSetupPrefix[] = L"setup";
++const wchar_t kSetupPrefix[] = BUILDFLAG(CHROME_SETUP_PREFIX_WIDE);
+ 
+ // Command line switch names for setup.exe.
+ const wchar_t kCmdInstallArchive[] = L"install-archive";
+diff --git a/chrome/installer/setup/BUILD.gn b/chrome/installer/setup/BUILD.gn
+index 2b1d7cb7ae..d756ff2e34 100644
+--- a/chrome/installer/setup/BUILD.gn
++++ b/chrome/installer/setup/BUILD.gn
+@@ -10,6 +10,7 @@ import("//testing/test.gni")
+ 
+ if (is_win) {
+   executable("setup") {
++    output_name = chrome_setup_base
+     sources = [
+       "setup.rc",
+       "setup_main.cc",
+diff --git a/chrome/installer/util/util_constants.cc b/chrome/installer/util/util_constants.cc
+index 8a81050f3e..083af9c0ff 100644
+--- a/chrome/installer/util/util_constants.cc
++++ b/chrome/installer/util/util_constants.cc
+@@ -179,14 +179,17 @@ const char kVerboseLogging[] = "verbose-logging";
+ // crbug.com/40296982).
+ // TODO(gab): Rename setup.exe itself altogether and use the same binary for
+ // Active Setup.
+-const wchar_t kActiveSetupExe[] = L"chrmstp.exe";
+-const wchar_t kChromeDll[] = L"chrome.dll";
+-const wchar_t kChromeExe[] = L"chrome.exe";
+-const wchar_t kChromeNewExe[] = L"new_chrome.exe";
+-const wchar_t kChromeOldExe[] = L"old_chrome.exe";
++const wchar_t kActiveSetupExe[] =
++    BUILDFLAG(CHROME_ACTIVE_SETUP_FILENAME_WIDE);
++const wchar_t kChromeDll[] = BUILDFLAG(CHROME_DLL_FILENAME_WIDE);
++const wchar_t kChromeExe[] = BUILDFLAG(CHROME_MAIN_EXE_FILENAME_WIDE);
++const wchar_t kChromeNewExe[] = BUILDFLAG(CHROME_NEW_MAIN_EXE_FILENAME_WIDE);
++const wchar_t kChromeOldExe[] = BUILDFLAG(CHROME_OLD_MAIN_EXE_FILENAME_WIDE);
+ const wchar_t kChromeProxyExe[] = BUILDFLAG(CHROME_PROXY_FILENAME_WIDE);
+-const wchar_t kChromeProxyNewExe[] = L"new_chrome_proxy.exe";
+-const wchar_t kChromeProxyOldExe[] = L"old_chrome_proxy.exe";
++const wchar_t kChromeProxyNewExe[] =
++    BUILDFLAG(CHROME_PROXY_NEW_FILENAME_WIDE);
++const wchar_t kChromeProxyOldExe[] =
++    BUILDFLAG(CHROME_PROXY_OLD_FILENAME_WIDE);
+ const wchar_t kCmdAlternateRenameChromeExe[] = L"rename-chrome-exe";
+ const wchar_t kCmdRenameChromeExe[] = L"cmd";
+ const wchar_t kCmdOnOsUpgrade[] = L"on-os-upgrade";
+@@ -206,7 +209,7 @@ const wchar_t kInstallTempDir[] = L"Temp";
+ const wchar_t kLnkExt[] = L".lnk";
+ const wchar_t kNotificationHelperExe[] =
+     BUILDFLAG(CHROME_NOTIFICATION_HELPER_FILENAME_WIDE);
+-const wchar_t kWerDll[] = L"chrome_wer.dll";
++const wchar_t kWerDll[] = BUILDFLAG(CHROME_WER_DLL_FILENAME_WIDE);
+ 
+ // DowngradeVersion holds the version from which Chrome was downgraded. In case
+ // of multiple downgrades (e.g., 75->74->73), it retains the highest version
+@@ -214,7 +217,7 @@ const wchar_t kWerDll[] = L"chrome_wer.dll";
+ // once Chrome reaches the version from which it was downgraded.
+ const wchar_t kRegDowngradeVersion[] = L"DowngradeVersion";
+ 
+-const wchar_t kSetupExe[] = L"setup.exe";
++const wchar_t kSetupExe[] = BUILDFLAG(CHROME_SETUP_FILENAME_WIDE);
+ const wchar_t kUninstallStringField[] = L"UninstallString";
+ const wchar_t kUninstallArgumentsField[] = L"UninstallArguments";
+ const wchar_t kUninstallDisplayNameField[] = L"DisplayName";
+diff --git a/chrome/tools/build/win/create_installer_archive.py b/chrome/tools/build/win/create_installer_archive.py
+index 3e5dbac139..91f4045202 100755
+--- a/chrome/tools/build/win/create_installer_archive.py
++++ b/chrome/tools/build/win/create_installer_archive.py
+@@ -36,6 +36,9 @@ ZUCCHINI_EXEC = "zucchini.exe"
+ MINI_INSTALLER_INPUT_FILE = "packed_files.txt"
+ PATCH_FILE_EXT = '.diff'
+ SETUP_EXEC = "setup.exe"
++CHROME_EXE = "chrome.exe"
++CHROME_DLL = "chrome.dll"
++NAME_MAP = {}
+ SETUP_PATCH_FILE_PREFIX = "setup_patch"
+ TEMP_ARCHIVE_DIR = "temp_installer_archive"
+ VERSION_FILE = "VERSION"
+@@ -244,11 +247,11 @@ def GetPrevVersion(build_dir, temp_dir, last_chrome_installer, output_name):
+         'x',
+         '-o"%s"' % temp_dir,
+         prev_archive_file,
+-        'Chrome-bin/*/chrome.dll',
++        'Chrome-bin/*/' + CHROME_DLL,
+     ]
+     RunSystemCommand(cmd, options.verbose)
+     dll_path = glob.glob(os.path.join(temp_dir, 'Chrome-bin', '*',
+-                                      'chrome.dll'))
++                                      CHROME_DLL))
+     return os.path.split(os.path.split(dll_path[0])[0])[1]
+ 
+ 
+@@ -263,6 +266,15 @@ def MakeStagingDirectory(staging_dir):
+     return file_path
+ 
+ 
++def _ApplyNameMap(config):
++    for section in config.sections():
++        for key in list(config[section]):
++            if key in NAME_MAP:
++                value = config[section][key]
++                del config[section][key]
++                config[section][NAME_MAP[key]] = value
++
++
+ def Readconfig(input_file, current_version):
+     """Reads config information from input file after setting default value of
+     global variables.
+@@ -599,9 +611,24 @@ def main(options):
+     """Main method that reads input file, creates archive file and writes
+     resource input file.
+     """
++    global SETUP_EXEC, CHROME_EXE, CHROME_DLL, NAME_MAP
++    SETUP_EXEC = options.setup_exe_name
++    CHROME_EXE = options.chrome_exe_name
++    CHROME_DLL = options.chrome_dll_name
++    NAME_MAP = {
++        "chrome.exe": options.chrome_exe_name,
++        "chrome.dll": options.chrome_dll_name,
++        "chrome_elf.dll": options.chrome_elf_name,
++        "chrome_proxy.exe": options.chrome_proxy_name,
++        "chrome_pwa_launcher.exe": options.chrome_pwa_launcher_name,
++        "chrome_wer.dll": options.chrome_wer_name,
++        "notification_helper.exe": options.notification_helper_name,
++        "setup.exe": options.setup_exe_name,
++    }
+     current_version = BuildVersion()
+ 
+     config = Readconfig(options.input_file, current_version)
++    _ApplyNameMap(config)
+ 
+     staging_dir = MakeStagingDirectory(options.staging_dir)
+ 
+@@ -759,6 +786,24 @@ def _ParseOptions():
+         '--setup_runtime_deps',
+         help='A file listing runtime dependencies for setup.exe. This will be '
+         'used to get a list of DLLs to archive in a component build.')
++    parser.add_option('--chrome_exe_name', default='chrome.exe',
++                      help='Name of the browser executable.')
++    parser.add_option('--chrome_dll_name', default='chrome.dll',
++                      help='Name of the browser DLL.')
++    parser.add_option('--chrome_elf_name', default='chrome_elf.dll',
++                      help='Name of the chrome elf DLL.')
++    parser.add_option('--chrome_proxy_name', default='chrome_proxy.exe',
++                      help='Name of the chrome proxy executable.')
++    parser.add_option('--chrome_pwa_launcher_name',
++                      default='chrome_pwa_launcher.exe',
++                      help='Name of the PWA launcher executable.')
++    parser.add_option('--chrome_wer_name', default='chrome_wer.dll',
++                      help='Name of the WER DLL.')
++    parser.add_option('--notification_helper_name',
++                      default='notification_helper.exe',
++                      help='Name of the notification helper executable.')
++    parser.add_option('--setup_exe_name', default='setup.exe',
++                      help='Name of the setup executable.')
+     parser.add_option(
+         '--target_arch',
+         default='x86',
+diff --git a/components/crash/win/BUILD.gn b/components/crash/win/BUILD.gn
+index 5e31703941..6d6f697400 100644
+--- a/components/crash/win/BUILD.gn
++++ b/components/crash/win/BUILD.gn
+@@ -15,6 +15,7 @@ process_version_rc_template("chrome_wer_resources") {
+ }
+ 
+ shared_library("chrome_wer") {
++  output_name = chrome_wer_dll_base
+   sources = [
+     "chrome_wer.def",
+     "chrome_wer_main.cc",
+-- 
+2.56.1
+

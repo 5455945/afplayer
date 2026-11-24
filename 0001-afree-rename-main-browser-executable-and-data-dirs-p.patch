@@ -1,0 +1,753 @@
+From 0045fc8cc787f120b5815930805d45cd47037d8f Mon Sep 17 00:00:00 2001
+From: "5455945@gmail.com" <5455945@gmail.com>
+Date: Tue, 24 Nov 2026 09:53:54 +0800
+Subject: [PATCH 1/3] afree: rename main browser executable and data dirs
+ (patch 1/3)
+
+---
+ build/config/BUILDCONFIG.gn                   |  9 ++
+ build/win/reorder-imports.py                  | 21 +++--
+ chrome/BUILD.gn                               | 85 +++++++++++++------
+ chrome/common/BUILD.gn                        | 27 ++++++
+ chrome/common/chrome_constants.cc             | 44 ++++++++++
+ chrome/common/chrome_paths_linux.cc           |  5 +-
+ chrome/common/chrome_paths_mac.mm             |  5 +-
+ chrome/install_static/BUILD.gn                |  1 +
+ .../install_static/chromium_install_modes.h   |  6 ++
+ chrome/installer/linux/BUILD.gn               |  9 +-
+ chrome/installer/mini_installer/BUILD.gn      |  7 +-
+ init_tools/build/build_linux.sh               | 10 +++
+ init_tools/build/build_linux_def.sh           |  4 +
+ init_tools/build/build_linux_help.sh          |  7 ++
+ init_tools/build/build_windows.sh             | 10 +++
+ init_tools/build/build_windows_def.sh         |  4 +
+ init_tools/build/build_windows_help.sh        |  7 ++
+ 17 files changed, 220 insertions(+), 41 deletions(-)
+
+diff --git a/build/config/BUILDCONFIG.gn b/build/config/BUILDCONFIG.gn
+index 077a26fc97..0ba8bf3862 100644
+--- a/build/config/BUILDCONFIG.gn
++++ b/build/config/BUILDCONFIG.gn
+@@ -204,6 +204,10 @@ declare_args() {
+   # Only honoured when is_afree=true. Empty keeps the upstream chrome://
+   # behaviour unchanged.
+   chrome_scheme = ""
++  # Optional main browser executable / process / default data-directory name.
++  # Only honoured when is_afree=true. Empty keeps the upstream platform
++  # defaults (chrome on Linux/Windows, the branded product name on macOS).
++  chrome_executable_name = ""
+ }
+ assert(!is_afree_sdk || is_afree,
+        "is_afree_sdk=true requires is_afree=true")
+@@ -217,6 +221,11 @@ chrome_scheme_alias = ""
+ if (is_afree && chrome_scheme != "") {
+   chrome_scheme_alias = chrome_scheme
+ }
++
++# Runtime executable/process/data-directory rename. This is an afree-only
++# feature; a value without is_afree=true is ignored. The build scripts print a
++# warning when this happens.
++chrome_executable_name_enabled = is_afree && chrome_executable_name != ""
+ # is_afree add end
+ 
+ if (enable_strict_deps) {
+diff --git a/build/win/reorder-imports.py b/build/win/reorder-imports.py
+index 88851609d4..9dc2fb19ec 100755
+--- a/build/win/reorder-imports.py
++++ b/build/win/reorder-imports.py
+@@ -15,8 +15,8 @@ sys.path.insert(
+                  'pefile_py3'))
+ import pefile
+ 
+-def reorder_imports(input_dir, output_dir, architecture):
+-  """Swap chrome_elf.dll to be the first import of chrome.exe.
++def reorder_imports(input_dir, output_dir, architecture, exe_name='chrome'):
++  """Swap chrome_elf.dll to be the first import of the browser executable.
+   Also copy over any related files that might be needed
+   (pdbs, manifests etc.).
+   """
+@@ -24,8 +24,8 @@ def reorder_imports(input_dir, output_dir, architecture):
+   # correct executable in the first place, so that this script
+   # only needs to verify that and not write a whole new exe.
+ 
+-  input_image = os.path.join(input_dir, 'chrome.exe')
+-  output_image = os.path.join(output_dir, 'chrome.exe')
++  input_image = os.path.join(input_dir, exe_name + '.exe')
++  output_image = os.path.join(output_dir, exe_name + '.exe')
+ 
+   # pefile mmap()s the whole executable, and then parses parts of
+   # it into python data structures for ease of processing.
+@@ -73,25 +73,28 @@ def reorder_imports(input_dir, output_dir, architecture):
+ 
+   pe.write(filename=output_image)
+ 
+-  for fname in glob.iglob(os.path.join(input_dir, 'chrome.exe.*')):
++  for fname in glob.iglob(os.path.join(input_dir, exe_name + '.exe.*')):
+     shutil.copy(fname, os.path.join(output_dir, os.path.basename(fname)))
+   return 0
+ 
+ 
+ def main(argv):
+-  usage = 'reorder_imports.py -i <input_dir> -o <output_dir> -a <target_arch>'
++  usage = ('reorder_imports.py -i <input_dir> -o <output_dir> '
++           '-a <target_arch> [-n <exe_name>]')
+   parser = optparse.OptionParser(usage=usage)
+-  parser.add_option('-i', '--input', help='reorder chrome.exe in DIR',
++  parser.add_option('-i', '--input', help='reorder browser exe in DIR',
+       metavar='DIR')
+-  parser.add_option('-o', '--output', help='write new chrome.exe to DIR',
++  parser.add_option('-o', '--output', help='write new browser exe to DIR',
+       metavar='DIR')
+   parser.add_option('-a', '--arch', help='architecture of build (optional)',
+       default='ia32')
++  parser.add_option('-n', '--exe-name', help='executable basename',
++      default='chrome', metavar='NAME')
+   opts, args = parser.parse_args()
+ 
+   if not opts.input or not opts.output:
+     parser.error('Please provide and input and output directory')
+-  return reorder_imports(opts.input, opts.output, opts.arch)
++  return reorder_imports(opts.input, opts.output, opts.arch, opts.exe_name)
+ 
+ if __name__ == "__main__":
+   sys.exit(main(sys.argv[1:]))
+diff --git a/chrome/BUILD.gn b/chrome/BUILD.gn
+index 18417167ff..4ddd5c156e 100644
+--- a/chrome/BUILD.gn
++++ b/chrome/BUILD.gn
+@@ -74,6 +74,25 @@ declare_args() {
+ 
+ assert(!is_ios, "Chromium/iOS shouldn't use anything in //chrome")
+ 
++# Runtime executable/target name. Defaults to the upstream chrome name; an
++# afree build may override it with chrome_executable_name.
++_chrome_target_name = "chrome"
++if (chrome_executable_name_enabled) {
++  _chrome_target_name = chrome_executable_name
++}
++
++_chrome_output_name = _chrome_target_name
++if (is_win) {
++  _chrome_output_name = "initialexe/$_chrome_target_name"
++}
++
++if (is_mac) {
++  _chrome_app_name = chrome_product_full_name
++  if (chrome_executable_name_enabled) {
++    _chrome_app_name = chrome_executable_name
++  }
++}
++
+ if (is_win && enable_resource_allowlist_generation) {
+   _chrome_resource_allowlist = "$target_gen_dir/chrome_resource_allowlist.txt"
+ }
+@@ -85,12 +104,12 @@ if (is_win) {
+     # initialexe/ is used so that the we can reorder imports and write back to
+     # the final destination at $root_out_dir/.
+     inputs = [
+-      "$root_out_dir/initialexe/chrome.exe",
+-      "$root_out_dir/initialexe/chrome.exe.pdb",
++      "$root_out_dir/${_chrome_output_name}.exe",
++      "$root_out_dir/${_chrome_output_name}.exe.pdb",
+     ]
+     outputs = [
+-      "$root_out_dir/chrome.exe",
+-      "$root_out_dir/chrome.exe.pdb",
++      "$root_out_dir/${_chrome_target_name}.exe",
++      "$root_out_dir/${_chrome_target_name}.exe.pdb",
+     ]
+     args = [
+       "-i",
+@@ -99,6 +118,8 @@ if (is_win) {
+       rebase_path("$root_out_dir", root_build_dir),
+       "-a",
+       current_cpu,
++      "-n",
++      _chrome_target_name,
+     ]
+     deps = [ ":chrome_initial" ]
+   }
+@@ -115,7 +136,7 @@ group("assert_no_deps") {
+   if (is_android) {
+     deps += [ "//chrome/android:chrome_public_apk" ]
+   } else {
+-    deps += [ ":chrome" ]
++    deps += [ ":$_chrome_target_name" ]
+   }
+ 
+   if (is_win) {
+@@ -129,17 +150,18 @@ group("assert_no_deps") {
+ }
+ 
+ if (!is_android && !is_mac) {
+-  group("chrome") {
++  group(_chrome_target_name) {
+     public_deps = [ ":chrome_initial" ]
+     data_deps = [ ":chrome_initial" ]
+ 
+-    # Do not add any more deps or data_deps to group("chrome").
+-    # Because chrome_initial sets its output name to "chrome", running commands
+-    # such as `ninja chrome` causes chrome_initial to be built instead. All
+-    # deps and data_deps should be added to the chrome_initial target instead.
+-    # Targets added here can only be built by explicitly using //chrome:chrome.
+-    # Windows-only deps are OK because chrome_initial uses initialexe/chrome as
+-    # the output name for that platform.
++    # Do not add any more deps or data_deps to this group.
++    # Because chrome_initial sets its output name to the target name, running
++    # commands such as `ninja <target>` causes chrome_initial to be built
++    # instead. All deps and data_deps should be added to the chrome_initial
++    # target instead. Targets added here can only be built by explicitly using
++    # //chrome:<target>.
++    # Windows-only deps are OK because chrome_initial uses initialexe/<target>
++    # as the output name for that platform.
+     # See crbug.com/40156324.
+     if (is_win) {
+       public_deps += [ ":reorder_imports" ]
+@@ -147,10 +169,12 @@ if (!is_android && !is_mac) {
+     }
+   }
+ 
+-  if (is_win) {
+-    _chrome_output_name = "initialexe/chrome"
+-  } else {
+-    _chrome_output_name = "chrome"
++  # Keep //chrome:chrome as a compatibility alias for the thousands of
++  # existing //chrome deps when the target has been renamed.
++  if (_chrome_target_name != "chrome") {
++    group("chrome") {
++      public_deps = [ ":$_chrome_target_name" ]
++    }
+   }
+ 
+   executable("chrome_initial") {
+@@ -474,7 +498,7 @@ if (is_win) {
+     objdump_path = rebase_path("$clang_base_path/bin/", root_build_dir)
+   }
+ 
+-  group("chrome") {
++  group(_chrome_target_name) {
+     deps = [ ":chrome_app" ]
+ 
+     data_deps = [ ":chrome_app" ]
+@@ -491,6 +515,12 @@ if (is_win) {
+     }
+   }
+ 
++  if (_chrome_target_name != "chrome") {
++    group("chrome") {
++      public_deps = [ ":$_chrome_target_name" ]
++    }
++  }
++
+   tweak_info_plist("chrome_app_plist") {
+     info_plist = "app/app-Info.plist"
+     args = [
+@@ -514,7 +544,7 @@ if (is_win) {
+   }
+ 
+   mac_app_bundle("chrome_app") {
+-    output_name = chrome_product_full_name
++    output_name = _chrome_app_name
+ 
+     info_plist_target = ":chrome_app_plist"
+     extra_substitutions = [
+@@ -570,7 +600,7 @@ if (is_win) {
+   if (verify_dynamic_libraries) {
+     action("verify_libraries_chrome_app") {
+       script = "//chrome/tools/build/mac/verify_dynamic_libraries.py"
+-      inputs = [ "${root_out_dir}/${chrome_product_full_name}.app/Contents/MacOS/${chrome_product_full_name}" ]
++      inputs = [ "${root_out_dir}/${_chrome_app_name}.app/Contents/MacOS/${_chrome_app_name}" ]
+       outputs = [ "$target_out_dir/run_$target_name.stamp" ]
+       args = [
+         "--stamp",
+@@ -702,7 +732,7 @@ if (is_win) {
+ 
+     outputs = [ _stamp_file ]
+ 
+-    _versions_dir = "$root_out_dir/$chrome_product_full_name.app/Contents/Frameworks/$chrome_framework_name.framework/Versions"
++    _versions_dir = "$root_out_dir/$_chrome_app_name.app/Contents/Frameworks/$chrome_framework_name.framework/Versions"
+ 
+     args = [
+       "--versions-dir",
+@@ -1301,7 +1331,7 @@ if (is_win) {
+     # This list must be updated with the two targets' deps list below, and
+     # the list of _dsyms in :chrome_dsym_archive.
+     _chrome_symbols_sources = [
+-      "$root_out_dir/$chrome_product_full_name.app/Contents/MacOS/$chrome_product_full_name",
++      "$root_out_dir/$_chrome_app_name.app/Contents/MacOS/$_chrome_app_name",
+       "$root_out_dir/chrome_crashpad_handler",
+       "$root_out_dir/libvk_swiftshader.dylib",
+       _framework_binary_path,
+@@ -1375,7 +1405,7 @@ if (is_win) {
+       # generate both the dSYM and binary image are listed in deps.
+       _dsyms = [
+         "$root_out_dir/$chrome_framework_name.dSYM",
+-        "$root_out_dir/$chrome_product_full_name.dSYM",
++        "$root_out_dir/$_chrome_app_name.dSYM",
+         "$root_out_dir/chrome_crashpad_handler.dSYM",
+         "$root_out_dir/libvk_swiftshader.dylib.dSYM",
+       ]
+@@ -1413,7 +1443,7 @@ if (is_win) {
+ 
+       sources = _chrome_symbols_sources
+ 
+-      _output = "$root_out_dir/$chrome_product_full_name.dSYM.tar.bz2"
++      _output = "$root_out_dir/$_chrome_app_name.dSYM.tar.bz2"
+ 
+       outputs = [ _output ]
+ 
+@@ -1718,7 +1748,7 @@ if (is_linux || is_chromeos) {
+       }
+     }
+     extract_symbols("chrome_symbols") {
+-      binary = "$root_out_dir/chrome"
++      binary = "$root_out_dir/$_chrome_target_name"
+ 
+       if (current_cpu == "x86") {
+         # GYP used "ia32" so keep that naming for back-compat.
+@@ -1842,8 +1872,9 @@ if (is_linux || is_chromeos) {
+ 
+ if (_cros_generate_embed_section_target) {
+   embed_sections("section_embedded_chrome_binary") {
+-    binary_input = "$root_out_dir/chrome"
+-    sections_embedded_binary_output = "$root_out_dir/chrome.sections_embedded"
++    binary_input = "$root_out_dir/$_chrome_target_name"
++    sections_embedded_binary_output =
++        "$root_out_dir/$_chrome_target_name.sections_embedded"
+     deps = [ ":chrome" ]
+   }
+ }
+diff --git a/chrome/common/BUILD.gn b/chrome/common/BUILD.gn
+index 1179b1f75c..ff1cf1fa41 100644
+--- a/chrome/common/BUILD.gn
++++ b/chrome/common/BUILD.gn
+@@ -45,6 +45,31 @@ grit("resources") {
+   ]
+ }
+ 
++_chrome_executable_name = ""
++if (chrome_executable_name_enabled) {
++  _chrome_executable_name = chrome_executable_name
++}
++_chrome_executable_filename = "$_chrome_executable_name.exe"
++_chrome_helper_executable_name = "$_chrome_executable_name Helper"
++_chrome_browser_executable_path =
++    "$_chrome_executable_name.app/Contents/MacOS/$_chrome_executable_name"
++_chrome_helper_executable_path =
++    "$_chrome_helper_executable_name.app/Contents/MacOS/$_chrome_helper_executable_name"
++
++buildflag_header("chrome_executable_name_buildflags") {
++  header = "chrome_executable_name_buildflags.h"
++  flags = [
++    "HAS_CHROME_EXECUTABLE_NAME=$chrome_executable_name_enabled",
++    "CHROME_EXECUTABLE_NAME=\"$_chrome_executable_name\"",
++    "CHROME_EXECUTABLE_FILENAME=\"$_chrome_executable_filename\"",
++    "CHROME_EXECUTABLE_NAME_WIDE=L\"$_chrome_executable_name\"",
++    "CHROME_EXECUTABLE_FILENAME_WIDE=L\"$_chrome_executable_filename\"",
++    "CHROME_HELPER_EXECUTABLE_NAME=\"$_chrome_helper_executable_name\"",
++    "CHROME_BROWSER_EXECUTABLE_PATH=\"$_chrome_browser_executable_path\"",
++    "CHROME_HELPER_EXECUTABLE_PATH=\"$_chrome_helper_executable_path\"",
++  ]
++}
++
+ buildflag_header("buildflags") {
+   header = "buildflags.h"
+   flags = [
+@@ -453,6 +478,7 @@ static_library("non_code_constants") {
+ 
+   deps = [
+     ":buildflags",
++    ":chrome_executable_name_buildflags",
+     ":version_header",
+     "//base",
+     "//content/public/common:buildflags",
+@@ -565,6 +591,7 @@ static_library("constants") {
+   ]
+ 
+   deps = [
++    ":chrome_executable_name_buildflags",
+     ":version_header",
+     "//base",
+     "//build:branding_buildflags",
+diff --git a/chrome/common/chrome_constants.cc b/chrome/common/chrome_constants.cc
+index 6e30ef1147..6a5100a9f7 100644
+--- a/chrome/common/chrome_constants.cc
++++ b/chrome/common/chrome_constants.cc
+@@ -5,6 +5,7 @@
+ #include "chrome/common/chrome_constants.h"
+ 
+ #include "build/build_config.h"
++#include "chrome/common/chrome_executable_name_buildflags.h"
+ #include "chrome/common/chrome_version.h"
+ 
+ #define FPL FILE_PATH_LITERAL
+@@ -31,35 +32,66 @@ const char kChromeVersion[] = CHROME_VERSION_STRING;
+ // do so.
+ 
+ #if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++const base::FilePath::CharType kBrowserProcessExecutableName[] =
++    BUILDFLAG(CHROME_EXECUTABLE_FILENAME_WIDE);
++const base::FilePath::CharType kHelperProcessExecutableName[] =
++    BUILDFLAG(CHROME_EXECUTABLE_FILENAME_WIDE);
++#else
+ const base::FilePath::CharType kBrowserProcessExecutableName[] =
+     FPL("chrome.exe");
+ const base::FilePath::CharType kHelperProcessExecutableName[] =
+     FPL("chrome.exe");
++#endif
+ #elif BUILDFLAG(IS_MAC)
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++const base::FilePath::CharType kBrowserProcessExecutableName[] =
++    BUILDFLAG(CHROME_EXECUTABLE_NAME);
++const base::FilePath::CharType kHelperProcessExecutableName[] =
++    BUILDFLAG(CHROME_HELPER_EXECUTABLE_NAME);
++#else
+ const base::FilePath::CharType kBrowserProcessExecutableName[] =
+     FPL(PRODUCT_FULLNAME_STRING);
+ const base::FilePath::CharType kHelperProcessExecutableName[] =
+     FPL(PRODUCT_FULLNAME_STRING " Helper");
++#endif
+ #elif BUILDFLAG(IS_ANDROID)
+ // NOTE: Keep it synced with the process names defined in AndroidManifest.xml.
+ const base::FilePath::CharType kBrowserProcessExecutableName[] = FPL("chrome");
+ const base::FilePath::CharType kHelperProcessExecutableName[] =
+     FPL("sandboxed_process");
+ #elif BUILDFLAG(IS_POSIX)
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++const base::FilePath::CharType kBrowserProcessExecutableName[] =
++    BUILDFLAG(CHROME_EXECUTABLE_NAME);
++#else
+ const base::FilePath::CharType kBrowserProcessExecutableName[] = FPL("chrome");
++#endif
+ // Helper processes end up with a name of "exe" due to execing via
+ // /proc/self/exe.  See bug 22703.
+ const base::FilePath::CharType kHelperProcessExecutableName[] = FPL("exe");
+ #endif  // OS_*
+ 
+ #if BUILDFLAG(IS_WIN)
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++const base::FilePath::CharType kBrowserProcessExecutablePath[] =
++    BUILDFLAG(CHROME_EXECUTABLE_FILENAME_WIDE);
++const base::FilePath::CharType kHelperProcessExecutablePath[] =
++    BUILDFLAG(CHROME_EXECUTABLE_FILENAME_WIDE);
++#else
+ const base::FilePath::CharType kBrowserProcessExecutablePath[] =
+     FPL("chrome.exe");
+ const base::FilePath::CharType kHelperProcessExecutablePath[] =
+     FPL("chrome.exe");
++#endif
+ #elif BUILDFLAG(IS_MAC)
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++const base::FilePath::CharType kBrowserProcessExecutablePath[] =
++    BUILDFLAG(CHROME_BROWSER_EXECUTABLE_PATH);
++#else
+ const base::FilePath::CharType kBrowserProcessExecutablePath[] =
+     FPL(PRODUCT_FULLNAME_STRING ".app/Contents/MacOS/" PRODUCT_FULLNAME_STRING);
++#endif
+ const base::FilePath::CharType
+     kGoogleChromeForTestingBrowserProcessExecutablePath[] =
+         FPL("Google Chrome for Testing.app/Contents/MacOS/Google Chrome for "
+@@ -68,15 +100,27 @@ const base::FilePath::CharType kGoogleChromeBrowserProcessExecutablePath[] =
+     FPL("Google Chrome.app/Contents/MacOS/Google Chrome");
+ const base::FilePath::CharType kChromiumBrowserProcessExecutablePath[] =
+     FPL("Chromium.app/Contents/MacOS/Chromium");
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++const base::FilePath::CharType kHelperProcessExecutablePath[] =
++    BUILDFLAG(CHROME_HELPER_EXECUTABLE_PATH);
++#else
+ const base::FilePath::CharType kHelperProcessExecutablePath[] =
+     FPL(PRODUCT_FULLNAME_STRING
+         " Helper.app/Contents/MacOS/" PRODUCT_FULLNAME_STRING " Helper");
++#endif
+ #elif BUILDFLAG(IS_ANDROID)
+ const base::FilePath::CharType kBrowserProcessExecutablePath[] = FPL("chrome");
+ const base::FilePath::CharType kHelperProcessExecutablePath[] = FPL("chrome");
+ #elif BUILDFLAG(IS_POSIX)
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++const base::FilePath::CharType kBrowserProcessExecutablePath[] =
++    BUILDFLAG(CHROME_EXECUTABLE_NAME);
++const base::FilePath::CharType kHelperProcessExecutablePath[] =
++    BUILDFLAG(CHROME_EXECUTABLE_NAME);
++#else
+ const base::FilePath::CharType kBrowserProcessExecutablePath[] = FPL("chrome");
+ const base::FilePath::CharType kHelperProcessExecutablePath[] = FPL("chrome");
++#endif
+ #endif  // OS_*
+ 
+ #if BUILDFLAG(IS_MAC)
+diff --git a/chrome/common/chrome_paths_linux.cc b/chrome/common/chrome_paths_linux.cc
+index 5575c049b2..b044b0992f 100644
+--- a/chrome/common/chrome_paths_linux.cc
++++ b/chrome/common/chrome_paths_linux.cc
+@@ -16,6 +16,7 @@
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+ #include "chrome/common/channel_info.h"
++#include "chrome/common/chrome_executable_name_buildflags.h"
+ #include "chrome/common/chrome_paths_internal.h"
+ 
+ namespace chrome {
+@@ -90,7 +91,9 @@ bool GetDefaultUserDataDirectory(base::FilePath* result) {
+         GetXDGDirectory(env.get(), kXdgConfigHomeEnvVar, kDotConfigDir);
+   }
+ 
+-#if BUILDFLAG(GOOGLE_CHROME_FOR_TESTING_BRANDING)
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++  std::string data_dir_basename = BUILDFLAG(CHROME_EXECUTABLE_NAME);
++#elif BUILDFLAG(GOOGLE_CHROME_FOR_TESTING_BRANDING)
+   std::string data_dir_basename = "google-chrome-for-testing";
+ #elif BUILDFLAG(GOOGLE_CHROME_BRANDING)
+   std::string data_dir_basename = "google-chrome";
+diff --git a/chrome/common/chrome_paths_mac.mm b/chrome/common/chrome_paths_mac.mm
+index 6829c9cb92..4d696bb1f2 100644
+--- a/chrome/common/chrome_paths_mac.mm
++++ b/chrome/common/chrome_paths_mac.mm
+@@ -19,6 +19,7 @@
+ #include "build/branding_buildflags.h"
+ #include "build/build_config.h"
+ #include "chrome/common/chrome_constants.h"
++#include "chrome/common/chrome_executable_name_buildflags.h"
+ #include "chrome/common/chrome_paths_internal.h"
+ 
+ namespace {
+@@ -32,7 +33,9 @@ char* ProductDirNameForBundle(NSBundle* chrome_bundle) {
+     product_dir_name = [product_dir_name_ns fileSystemRepresentation];
+ 
+     if (!product_dir_name) {
+-#if BUILDFLAG(GOOGLE_CHROME_FOR_TESTING_BRANDING)
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++      product_dir_name = BUILDFLAG(CHROME_EXECUTABLE_NAME);
++#elif BUILDFLAG(GOOGLE_CHROME_FOR_TESTING_BRANDING)
+       product_dir_name = "Google/Chrome for Testing";
+ #elif BUILDFLAG(GOOGLE_CHROME_BRANDING)
+       product_dir_name = "Google/Chrome";
+diff --git a/chrome/install_static/BUILD.gn b/chrome/install_static/BUILD.gn
+index dc056db749..56b752f0ff 100644
+--- a/chrome/install_static/BUILD.gn
++++ b/chrome/install_static/BUILD.gn
+@@ -28,6 +28,7 @@ if (is_win) {
+       ":buildflags",
+       "//build:branding_buildflags",
+       "//chrome/chrome_elf:nt_registry",
++      "//chrome/common:chrome_executable_name_buildflags",
+     ]
+ 
+     sources = [
+diff --git a/chrome/install_static/chromium_install_modes.h b/chrome/install_static/chromium_install_modes.h
+index f29a8228fe..09f805cd56 100644
+--- a/chrome/install_static/chromium_install_modes.h
++++ b/chrome/install_static/chromium_install_modes.h
+@@ -10,6 +10,7 @@
+ #include <array>
+ 
+ #include "chrome/app/chrome_dll_resource.h"
++#include "chrome/common/chrome_executable_name_buildflags.h"
+ #include "chrome/common/chrome_icon_resources_win.h"
+ #include "chrome/install_static/install_constants.h"
+ 
+@@ -21,7 +22,12 @@ inline constexpr wchar_t kCompanyPathName[] = L"";
+ 
+ // The brand-specific product name to be included as a component of the install
+ // and user data directory paths.
++#if BUILDFLAG(HAS_CHROME_EXECUTABLE_NAME)
++inline constexpr wchar_t kProductPathName[] =
++    BUILDFLAG(CHROME_EXECUTABLE_NAME_WIDE);
++#else
+ inline constexpr wchar_t kProductPathName[] = L"Chromium";
++#endif
+ 
+ // The brand-specific safe browsing client name.
+ inline constexpr char kSafeBrowsingName[] = "chromium";
+diff --git a/chrome/installer/linux/BUILD.gn b/chrome/installer/linux/BUILD.gn
+index e1aca5fd6e..4e67953a1c 100644
+--- a/chrome/installer/linux/BUILD.gn
++++ b/chrome/installer/linux/BUILD.gn
+@@ -59,8 +59,13 @@ if (current_cpu == "x86") {
+   assert(false, "Linux installer not configured for this architecture.")
+ }
+ 
++_chrome_binary_name = "chrome"
++if (chrome_executable_name_enabled) {
++  _chrome_binary_name = chrome_executable_name
++}
++
+ packaging_files_executables = [
+-  "$root_out_dir/chrome",
++  "$root_out_dir/$_chrome_binary_name",
+   "$root_out_dir/chrome_crashpad_handler",
+   "$root_out_dir/chrome_management_service",
+   "$root_out_dir/chrome_sandbox",
+@@ -198,7 +203,7 @@ action("merge_rpm_dependencies") {
+ }
+ 
+ strip_binary("strip_chrome_binary") {
+-  binary_input = "$root_out_dir/chrome"
++  binary_input = "$root_out_dir/$_chrome_binary_name"
+   deps = [ "//chrome" ]
+ }
+ 
+diff --git a/chrome/installer/mini_installer/BUILD.gn b/chrome/installer/mini_installer/BUILD.gn
+index 37a9269380..b9a10dd067 100644
+--- a/chrome/installer/mini_installer/BUILD.gn
++++ b/chrome/installer/mini_installer/BUILD.gn
+@@ -139,6 +139,11 @@ if (enable_uncompressed_archive) {
+       "$target_gen_dir/mini_installer/packed_files_uncompressed.rc"
+ }
+ 
++_chrome_exe_name = "chrome"
++if (chrome_executable_name_enabled) {
++  _chrome_exe_name = chrome_executable_name
++}
++
+ action("mini_installer_archive") {
+   script = "//chrome/tools/build/win/create_installer_archive.py"
+ 
+@@ -147,7 +152,7 @@ action("mini_installer_archive") {
+   inputs = [
+     "$root_out_dir/chrome.dll",
+     "$root_out_dir/chrome_elf.dll",
+-    "$root_out_dir/chrome.exe",
++    "$root_out_dir/$_chrome_exe_name.exe",
+     "$root_out_dir/locales/en-US.pak",
+     "$root_out_dir/setup.exe",
+     "//chrome/tools/build/win/makecab.py",
+diff --git a/init_tools/build/build_linux.sh b/init_tools/build/build_linux.sh
+index 494263eb36..dfd4ab7d6c 100755
+--- a/init_tools/build/build_linux.sh
++++ b/init_tools/build/build_linux.sh
+@@ -274,6 +274,16 @@ build_gn_args() {
+     fi
+   fi
+ 
++  # Optional main browser executable/process/data-directory rename. Like
++  # chrome_scheme, it is an is_afree-only feature.
++  if [[ -n "${chrome_executable_name:-}" ]]; then
++    if [[ "${extra_gn_args:-}" =~ is_afree[[:space:]]*=[[:space:]]*true ]]; then
++      args+=("chrome_executable_name=\"${chrome_executable_name}\"")
++    else
++      log "WARNING: ignoring chrome_executable_name='${chrome_executable_name}' because is_afree=true was not specified"
++    fi
++  fi
++
+   # Extra user-provided gn args are appended LAST so they override the defaults
+   # above (GN's args.gn is evaluated top-to-bottom, last assignment wins).
+   if [[ -n "${extra_gn_args:-}" ]]; then
+diff --git a/init_tools/build/build_linux_def.sh b/init_tools/build/build_linux_def.sh
+index 336c9170cb..75ee80bb27 100755
+--- a/init_tools/build/build_linux_def.sh
++++ b/init_tools/build/build_linux_def.sh
+@@ -45,6 +45,10 @@ NO_STRIP_DEFAULT=false
+ # upstream chrome:// behaviour. Ignored unless is_afree=true is also passed.
+ CHROME_SCHEME_DEFAULT=""
+ 
++# Optional main browser executable/process/data-directory name (e.g. "afree").
++# Empty keeps the upstream defaults. Ignored unless is_afree=true is passed.
++CHROME_EXECUTABLE_NAME_DEFAULT=""
++
+ # Extra chromium GN args appended verbatim to the generated args
+ # (e.g. "--gn-args='key=value ...'" or "--gn-arg=key=value").
+ EXTRA_GN_ARGS_DEFAULT=""
+diff --git a/init_tools/build/build_linux_help.sh b/init_tools/build/build_linux_help.sh
+index d9910f697c..b20ae1b715 100755
+--- a/init_tools/build/build_linux_help.sh
++++ b/init_tools/build/build_linux_help.sh
+@@ -51,6 +51,10 @@ Build target / sanitizer / misc:
+   --chrome-scheme=<name>  Set the afree scheme alias (e.g. afree). Ignored
+                           unless is_afree=true is also passed; empty keeps
+                           chrome:// (default: empty)
++  --chrome-executable-name=<name>
++                          Set the main browser executable/process/data-dir
++                          name (e.g. afree). Ignored unless is_afree=true is
++                          also passed; empty keeps the platform defaults
+   --jobs=<n>, -j<n>       Parallel jobs for autoninja (default: ${BUILD_JOBS_DEFAULT})
+   --gn-args="k=v ..."     Extra chromium GN args (can override the defaults above)
+   --gn-arg=k=v            Extra chromium GN arg (repeatable, alias of --gn-args)
+@@ -108,6 +112,7 @@ parse_build_params() {
+   jobs="${BUILD_JOBS_DEFAULT}"
+   extra_gn_args="${EXTRA_GN_ARGS_DEFAULT}"
+   chrome_scheme="${CHROME_SCHEME_DEFAULT}"
++  chrome_executable_name="${CHROME_EXECUTABLE_NAME_DEFAULT}"
+   asan_enabled=false
+ 
+   local arg lower_arg
+@@ -133,6 +138,8 @@ parse_build_params() {
+       --jobs)                 jobs="${1:-}"; shift ;;
+       --chrome-scheme=*|--chrome_scheme=*)
+                               chrome_scheme="${arg#*=}" ;;
++      --chrome-executable-name=*|--chrome_executable_name=*)
++                              chrome_executable_name="${arg#*=}" ;;
+       --gn-args=*)            extra_gn_args="${extra_gn_args:+${extra_gn_args} }${arg#*=}" ;;
+       --gn-arg=*)             extra_gn_args="${extra_gn_args:+${extra_gn_args} }${arg#*=}" ;;
+       -j=*)                   jobs="${arg#*=}" ;;
+diff --git a/init_tools/build/build_windows.sh b/init_tools/build/build_windows.sh
+index 495f271ad8..b3c6547d7c 100755
+--- a/init_tools/build/build_windows.sh
++++ b/init_tools/build/build_windows.sh
+@@ -538,6 +538,16 @@ build_gn_args() {
+     fi
+   fi
+ 
++  # Optional main browser executable/process/data-directory rename. Like
++  # chrome_scheme, it is an is_afree-only feature.
++  if [ -n "${chrome_executable_name:-}" ]; then
++    if [[ "${extra_gn_args:-}" =~ is_afree[[:space:]]*=[[:space:]]*true ]]; then
++      args+=("chrome_executable_name=\"${chrome_executable_name}\"")
++    else
++      log "WARNING: ignoring chrome_executable_name='${chrome_executable_name}' because is_afree=true was not specified"
++    fi
++  fi
++
+   # Extra user-provided gn args are appended LAST so they override the defaults
+   # above (GN's args.gn is evaluated top-to-bottom, last assignment wins).
+   if [ -n "${extra_gn_args:-}" ]; then
+diff --git a/init_tools/build/build_windows_def.sh b/init_tools/build/build_windows_def.sh
+index 5076e3aeb6..1a321e4e38 100755
+--- a/init_tools/build/build_windows_def.sh
++++ b/init_tools/build/build_windows_def.sh
+@@ -46,6 +46,10 @@ NO_CCACHE_DEFAULT=false
+ # upstream chrome:// behaviour. Ignored unless is_afree=true is also passed.
+ WIN_CHROME_SCHEME_DEFAULT=""
+ 
++# Optional main browser executable/process/data-directory name (e.g. "afree").
++# Empty keeps the upstream defaults. Ignored unless is_afree=true is passed.
++WIN_CHROME_EXECUTABLE_NAME_DEFAULT=""
++
+ # Extra chromium GN args appended verbatim to the generated args
+ # (e.g. "--gn-args='key=value ...'" or "--gn-arg=key=value").
+ WIN_EXTRA_GN_ARGS_DEFAULT=""
+diff --git a/init_tools/build/build_windows_help.sh b/init_tools/build/build_windows_help.sh
+index c008e92396..dc9cec5774 100755
+--- a/init_tools/build/build_windows_help.sh
++++ b/init_tools/build/build_windows_help.sh
+@@ -67,6 +67,10 @@ Targets / misc:
+   --chrome-scheme=<name>     Set the afree scheme alias (e.g. afree). Ignored
+                              unless is_afree=true is also passed; empty keeps
+                              chrome:// (default: empty)
++  --chrome-executable-name=<name>
++                             Set the main browser executable/process/data-dir
++                             name (e.g. afree). Ignored unless is_afree=true is
++                             also passed; empty keeps the platform defaults
+ 
+   -h, --help                 Show this help message
+ 
+@@ -112,6 +116,7 @@ parse_build_params() {
+   jobs="${WIN_BUILD_JOBS_DEFAULT}"
+   extra_gn_args="${WIN_EXTRA_GN_ARGS_DEFAULT}"
+   chrome_scheme="${WIN_CHROME_SCHEME_DEFAULT}"
++  chrome_executable_name="${WIN_CHROME_EXECUTABLE_NAME_DEFAULT}"
+   win_targets=""
+   no_ccache="${NO_CCACHE_DEFAULT}"
+ 
+@@ -141,6 +146,8 @@ parse_build_params() {
+       --jobs)                       jobs="${1:-}"; shift ;;
+       --chrome-scheme=*|--chrome_scheme=*)
+                                     chrome_scheme="${arg#*=}" ;;
++      --chrome-executable-name=*|--chrome_executable_name=*)
++                                    chrome_executable_name="${arg#*=}" ;;
+       --gn-args=*)                  extra_gn_args="${extra_gn_args:+${extra_gn_args} }${arg#*=}" ;;
+       --gn-arg=*)                   extra_gn_args="${extra_gn_args:+${extra_gn_args} }${arg#*=}" ;;
+       -j=*)                         jobs="${arg#*=}" ;;
+-- 
+2.56.1
+
