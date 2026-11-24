@@ -1,0 +1,416 @@
+From 1daf5c6c8ebcbebd53fa4f162afd36bf80fe0548 Mon Sep 17 00:00:00 2001
+From: "5455945@gmail.com" <5455945@gmail.com>
+Date: Tue, 24 Nov 2026 08:58:34 +0800
+Subject: [PATCH] schema chrome ==> afree (address bar only)
+
+---
+ build/config/BUILD.gn                         |  7 +++
+ build/config/BUILDCONFIG.gn                   | 12 ++++
+ .../chrome_autocomplete_scheme_classifier.cc  | 10 ++++
+ .../browser/chrome_content_browser_client.cc  | 60 +++++++++++++++++++
+ .../browser/chrome_content_browser_client.h   |  9 +++
+ .../browser/location_bar_model_impl.cc        | 11 ++++
+ components/url_formatter/url_fixer.cc         | 25 ++++++--
+ init_tools/build/build_linux.sh               | 11 ++++
+ init_tools/build/build_linux_def.sh           |  4 ++
+ init_tools/build/build_linux_help.sh          |  6 ++
+ init_tools/build/build_windows.sh             | 11 ++++
+ init_tools/build/build_windows_def.sh         |  4 ++
+ init_tools/build/build_windows_help.sh        |  6 ++
+ 13 files changed, 171 insertions(+), 5 deletions(-)
+
+diff --git a/build/config/BUILD.gn b/build/config/BUILD.gn
+index 72ccd0823e..6421ea7b74 100644
+--- a/build/config/BUILD.gn
++++ b/build/config/BUILD.gn
+@@ -47,6 +47,13 @@ if (is_android) {
+ config("feature_flags") {
+   defines = []
+   rustflags = []
++
++  # Optional chrome:// scheme alias (e.g. "afree"). Only enabled for afree
++  # builds that explicitly pass chrome_scheme; empty keeps chrome:// as-is.
++  if (chrome_scheme_alias != "") {
++    defines += [ "CHROME_SCHEME_ALIAS=\"$chrome_scheme_alias\"" ]
++  }
++
+   if (dcheck_always_on) {
+     defines += [ "DCHECK_ALWAYS_ON=1" ]
+     rustflags += [ "-Cdebug-assertions" ]
+diff --git a/build/config/BUILDCONFIG.gn b/build/config/BUILDCONFIG.gn
+index bddd38fdb5..077a26fc97 100644
+--- a/build/config/BUILDCONFIG.gn
++++ b/build/config/BUILDCONFIG.gn
+@@ -200,11 +200,23 @@ declare_args() {
+   # is_afree_sdk. When false the related code is not compiled at all.
+   afree_multi_display = false
+   afree_build_id = ""
++  # Optional address-bar alias for the internal chrome:// scheme, e.g. "afree".
++  # Only honoured when is_afree=true. Empty keeps the upstream chrome://
++  # behaviour unchanged.
++  chrome_scheme = ""
+ }
+ assert(!is_afree_sdk || is_afree,
+        "is_afree_sdk=true requires is_afree=true")
+ assert(!afree_multi_display || is_afree_sdk,
+        "afree_multi_display=true requires is_afree_sdk=true")
++
++# Effective alias used by the C++ code. Empty means "use upstream chrome://".
++# chrome_scheme is intentionally ignored unless is_afree=true, keeping the
++# default (non-afree) code path byte-for-byte identical to upstream.
++chrome_scheme_alias = ""
++if (is_afree && chrome_scheme != "") {
++  chrome_scheme_alias = chrome_scheme
++}
+ # is_afree add end
+ 
+ if (enable_strict_deps) {
+diff --git a/chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.cc b/chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.cc
+index 2f7ea50b69..c32ed17648 100644
+--- a/chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.cc
++++ b/chrome/browser/autocomplete/chrome_autocomplete_scheme_classifier.cc
+@@ -68,6 +68,16 @@ ChromeAutocompleteSchemeClassifier::GetInputTypeForScheme(
+   if (scheme.empty()) {
+     return metrics::OmniboxInputType::EMPTY;
+   }
++
++#if defined(CHROME_SCHEME_ALIAS)
++  // Treat the configured internal-scheme alias (e.g. afree://version) as a
++  // navigable URL. Without this the unknown scheme would be classified as a
++  // search query before the BrowserURLHandler can map it to chrome://.
++  if (base::EqualsCaseInsensitiveASCII(scheme, CHROME_SCHEME_ALIAS)) {
++    return metrics::OmniboxInputType::URL;
++  }
++#endif
++
+   if (base::IsStringASCII(scheme) &&
+       (ProfileIOData::IsHandledProtocol(scheme) ||
+        base::EqualsCaseInsensitiveASCII(scheme, content::kViewSourceScheme) ||
+diff --git a/chrome/browser/chrome_content_browser_client.cc b/chrome/browser/chrome_content_browser_client.cc
+index ea8f176252..61e4cd54c8 100644
+--- a/chrome/browser/chrome_content_browser_client.cc
++++ b/chrome/browser/chrome_content_browser_client.cc
+@@ -5177,6 +5177,15 @@ void ChromeContentBrowserClient::BrowserURLHandlerCreated(
+                           &search::HandleNewTabURLReverseRewrite);
+ #endif  // BUILDFLAG(IS_ANDROID)
+ 
++#if defined(CHROME_SCHEME_ALIAS)
++  // Optional afree scheme alias (e.g. afree://version). Registered before the
++  // regular WebUI handler so it gets the first chance to map the alias to the
++  // canonical chrome:// URL while keeping the alias as the displayed URL.
++  handler->AddHandlerPair(
++      &ChromeContentBrowserClient::HandleChromeSchemeAlias,
++      &ChromeContentBrowserClient::HandleChromeSchemeAliasReverse);
++#endif
++
+   // chrome: & friends.
+   handler->AddHandlerPair(&ChromeContentBrowserClient::HandleWebUI,
+                           &ChromeContentBrowserClient::HandleWebUIReverse);
+@@ -7513,6 +7522,57 @@ bool ChromeContentBrowserClient::HandleWebUIReverse(
+          url->GetHost() == chrome::kChromeUISettingsHost;
+ }
+ 
++// static
++bool ChromeContentBrowserClient::HandleChromeSchemeAlias(
++    GURL* url,
++    content::BrowserContext* browser_context) {
++#if defined(CHROME_SCHEME_ALIAS)
++  if (!url->SchemeIs(CHROME_SCHEME_ALIAS)) {
++    return false;
++  }
++
++  // Load the equivalent chrome:// URL, but keep the original alias URL as the
++  // navigation entry's virtual URL so the address bar shows afree://....
++  GURL original_url = *url;
++  GURL::Replacements replacements;
++  replacements.SetSchemeStr(content::kChromeUIScheme);
++  *url = url->ReplaceComponents(replacements);
++
++  if (!HandleWebUI(url, browser_context)) {
++    *url = original_url;
++    return false;
++  }
++  return true;
++#else
++  (void)url;
++  (void)browser_context;
++  return false;
++#endif
++}
++
++// static
++bool ChromeContentBrowserClient::HandleChromeSchemeAliasReverse(
++    GURL* url,
++    content::BrowserContext* browser_context) {
++#if defined(CHROME_SCHEME_ALIAS)
++  // This is only reached when the original virtual URL matched the alias
++  // forward handler above, so it is safe to map the displayed chrome:// URL
++  // back to the configured alias.
++  if (!url->SchemeIs(content::kChromeUIScheme)) {
++    return false;
++  }
++
++  GURL::Replacements replacements;
++  replacements.SetSchemeStr(CHROME_SCHEME_ALIAS);
++  *url = url->ReplaceComponents(replacements);
++  return true;
++#else
++  (void)url;
++  (void)browser_context;
++  return false;
++#endif
++}
++
+ void ChromeContentBrowserClient::AddExtraPart(
+     std::unique_ptr<ChromeContentBrowserClientParts> part) {
+   extra_parts_.push_back(std::move(part));
+diff --git a/chrome/browser/chrome_content_browser_client.h b/chrome/browser/chrome_content_browser_client.h
+index 7e779ca9e7..dc8ca7da42 100644
+--- a/chrome/browser/chrome_content_browser_client.h
++++ b/chrome/browser/chrome_content_browser_client.h
+@@ -1253,6 +1253,15 @@ class ChromeContentBrowserClient : public content::ContentBrowserClient {
+   static bool HandleWebUI(GURL* url, content::BrowserContext* browser_context);
+   static bool HandleWebUIReverse(GURL* url,
+                                  content::BrowserContext* browser_context);
++  // Maps the optional afree scheme alias (e.g. afree://version) to the
++  // canonical chrome:// scheme for loading, while keeping the alias as the
++  // navigation entry's virtual (displayed) URL.
++  static bool HandleChromeSchemeAlias(
++      GURL* url,
++      content::BrowserContext* browser_context);
++  static bool HandleChromeSchemeAliasReverse(
++      GURL* url,
++      content::BrowserContext* browser_context);
+ 
+   // Used by subclasses (e.g. implemented by downstream embedders) to add
+   // their own extra part objects.
+diff --git a/components/omnibox/browser/location_bar_model_impl.cc b/components/omnibox/browser/location_bar_model_impl.cc
+index 884e042c5a..503caf4819 100644
+--- a/components/omnibox/browser/location_bar_model_impl.cc
++++ b/components/omnibox/browser/location_bar_model_impl.cc
+@@ -108,6 +108,17 @@ std::u16string LocationBarModelImpl::GetFormattedURL(
+ 
+   GURL url(GetURL());
+ 
++#if defined(CHROME_SCHEME_ALIAS)
++  // Show every internal chrome:// page with the configured alias in the
++  // address bar. Loading still uses the canonical chrome:// URL, so WebUI
++  // resources such as chrome://resources and chrome://theme keep working.
++  if (url.SchemeIs("chrome")) {
++    GURL::Replacements replacements;
++    replacements.SetSchemeStr(CHROME_SCHEME_ALIAS);
++    url = url.ReplaceComponents(replacements);
++  }
++#endif
++
+ #if BUILDFLAG(IS_IOS)
+   // On iOS, the blob: display URLs should be simply the domain name. However,
+   // url_formatter parses everything past blob: as path, not domain, so swap
+diff --git a/components/url_formatter/url_fixer.cc b/components/url_formatter/url_fixer.cc
+index d5d9a14c8d..c2c8773d97 100644
+--- a/components/url_formatter/url_fixer.cc
++++ b/components/url_formatter/url_fixer.cc
+@@ -38,11 +38,26 @@ namespace {
+ 
+ // Hardcode these constants to avoid dependences on //chrome and //content.
+ const char kChromeUIScheme[] = "chrome";
++#if defined(CHROME_SCHEME_ALIAS)
++const char kChromeSchemeAlias[] = CHROME_SCHEME_ALIAS;
++#endif
+ const char kDevToolsScheme[] = "devtools";
+ const char kChromeUIDefaultHost[] = "version";
+ const char kViewSourceScheme[] = "view-source";
+ const size_t kMaxFixupURLDepth = 16;
+ 
++// Returns true for the canonical chrome:// scheme and, when configured, for
++// the afree build's address-bar alias (e.g. afree://).
++bool IsChromeScheme(const std::string& scheme) {
++  if (scheme == kChromeUIScheme)
++    return true;
++#if defined(CHROME_SCHEME_ALIAS)
++  return scheme == kChromeSchemeAlias;
++#else
++  return false;
++#endif
++}
++
+ // TODO(estade): Remove these ugly, ugly functions. They are only used in
+ // SegmentURL. A url::Parsed object keeps track of a bunch of indices into
+ // a url string, and these need to be updated when the URL is converted from
+@@ -445,7 +460,7 @@ std::string SegmentURLInternal(std::string* text, url::Parsed* parts) {
+       (*text)[semicolon] = ':';
+       if (GetValidScheme(*text, &parts->scheme, &scheme) &&
+           (url::IsStandard(scheme) || scheme == url::kAboutScheme ||
+-           scheme == kChromeUIScheme || scheme == url::kFileScheme)) {
++           IsChromeScheme(scheme) || scheme == url::kFileScheme)) {
+         found_scheme = true;
+       } else {
+         (*text)[semicolon] = ';';
+@@ -460,7 +475,7 @@ std::string SegmentURLInternal(std::string* text, url::Parsed* parts) {
+ 
+   // Proceed with about, chrome, and devtools schemes,
+   // but not file or nonstandard schemes.
+-  if ((scheme != url::kAboutScheme) && (scheme != kChromeUIScheme) &&
++  if ((scheme != url::kAboutScheme) && !IsChromeScheme(scheme) &&
+       (scheme != kDevToolsScheme) && !url::IsStandard(scheme)) {
+     return scheme;
+   }
+@@ -614,7 +629,7 @@ GURL FixupURLInternal(const std::string& text,
+ 
+   // For some schemes whose layouts we understand, we rebuild the URL.
+   bool chrome_url =
+-      (scheme == url::kAboutScheme) || (scheme == kChromeUIScheme);
++      (scheme == url::kAboutScheme) || IsChromeScheme(scheme);
+   bool devtools_url = (scheme == kDevToolsScheme);
+   if (chrome_url || devtools_url || url::IsStandard(scheme)) {
+     // Replace the about: scheme with the chrome: scheme.
+@@ -740,8 +755,8 @@ void OffsetComponent(int offset, url::Component* part) {
+ bool IsEquivalentScheme(const std::string& scheme1,
+                         const std::string& scheme2) {
+   return scheme1 == scheme2 ||
+-         (scheme1 == url::kAboutScheme && scheme2 == kChromeUIScheme) ||
+-         (scheme1 == kChromeUIScheme && scheme2 == url::kAboutScheme);
++         (scheme1 == url::kAboutScheme && IsChromeScheme(scheme2)) ||
++         (IsChromeScheme(scheme1) && scheme2 == url::kAboutScheme);
+ }
+ 
+ }  // namespace url_formatter
+diff --git a/init_tools/build/build_linux.sh b/init_tools/build/build_linux.sh
+index fd594acc65..494263eb36 100755
+--- a/init_tools/build/build_linux.sh
++++ b/init_tools/build/build_linux.sh
+@@ -263,6 +263,17 @@ build_gn_args() {
+   if [[ -n "${CCACHE_BIN:-}" && "$no_ccache" != "true" ]]; then
+     args+=("cc_wrapper=\"${CCACHE_BIN}\"")
+   fi
++  # Optional address-bar scheme alias (e.g. afree://version). This is an
++  # is_afree-only feature. If is_afree=true is not supplied, ignore
++  # chrome_scheme entirely so the default chrome:// code path is untouched.
++  if [[ -n "${chrome_scheme:-}" ]]; then
++    if [[ "${extra_gn_args:-}" =~ is_afree[[:space:]]*=[[:space:]]*true ]]; then
++      args+=("chrome_scheme=\"${chrome_scheme}\"")
++    else
++      log "WARNING: ignoring chrome_scheme='${chrome_scheme}' because is_afree=true was not specified"
++    fi
++  fi
++
+   # Extra user-provided gn args are appended LAST so they override the defaults
+   # above (GN's args.gn is evaluated top-to-bottom, last assignment wins).
+   if [[ -n "${extra_gn_args:-}" ]]; then
+diff --git a/init_tools/build/build_linux_def.sh b/init_tools/build/build_linux_def.sh
+index 7777855455..336c9170cb 100755
+--- a/init_tools/build/build_linux_def.sh
++++ b/init_tools/build/build_linux_def.sh
+@@ -41,6 +41,10 @@ NO_CCACHE_DEFAULT=false
+ # crash symbolization). --no-strip skips it.
+ NO_STRIP_DEFAULT=false
+ 
++# Optional internal chrome:// scheme alias (e.g. "afree"). Empty keeps the
++# upstream chrome:// behaviour. Ignored unless is_afree=true is also passed.
++CHROME_SCHEME_DEFAULT=""
++
+ # Extra chromium GN args appended verbatim to the generated args
+ # (e.g. "--gn-args='key=value ...'" or "--gn-arg=key=value").
+ EXTRA_GN_ARGS_DEFAULT=""
+diff --git a/init_tools/build/build_linux_help.sh b/init_tools/build/build_linux_help.sh
+index 2b1d052783..d9910f697c 100755
+--- a/init_tools/build/build_linux_help.sh
++++ b/init_tools/build/build_linux_help.sh
+@@ -48,6 +48,9 @@ Build target / sanitizer / misc:
+   --UseBuildId            Record git commit hash as the build id
+   --no-ccache             Disable ccache
+   --no-strip              Skip stripping; keep the unstripped executable as-is
++  --chrome-scheme=<name>  Set the afree scheme alias (e.g. afree). Ignored
++                          unless is_afree=true is also passed; empty keeps
++                          chrome:// (default: empty)
+   --jobs=<n>, -j<n>       Parallel jobs for autoninja (default: ${BUILD_JOBS_DEFAULT})
+   --gn-args="k=v ..."     Extra chromium GN args (can override the defaults above)
+   --gn-arg=k=v            Extra chromium GN arg (repeatable, alias of --gn-args)
+@@ -104,6 +107,7 @@ parse_build_params() {
+   no_strip="${NO_STRIP_DEFAULT}"
+   jobs="${BUILD_JOBS_DEFAULT}"
+   extra_gn_args="${EXTRA_GN_ARGS_DEFAULT}"
++  chrome_scheme="${CHROME_SCHEME_DEFAULT}"
+   asan_enabled=false
+ 
+   local arg lower_arg
+@@ -127,6 +131,8 @@ parse_build_params() {
+       --no-strip)             no_strip=true ;;
+       --jobs=*)               jobs="${arg#*=}" ;;
+       --jobs)                 jobs="${1:-}"; shift ;;
++      --chrome-scheme=*|--chrome_scheme=*)
++                              chrome_scheme="${arg#*=}" ;;
+       --gn-args=*)            extra_gn_args="${extra_gn_args:+${extra_gn_args} }${arg#*=}" ;;
+       --gn-arg=*)             extra_gn_args="${extra_gn_args:+${extra_gn_args} }${arg#*=}" ;;
+       -j=*)                   jobs="${arg#*=}" ;;
+diff --git a/init_tools/build/build_windows.sh b/init_tools/build/build_windows.sh
+index a2fe7e78f6..495f271ad8 100755
+--- a/init_tools/build/build_windows.sh
++++ b/init_tools/build/build_windows.sh
+@@ -527,6 +527,17 @@ build_gn_args() {
+     args+=("cc_wrapper=\"${CCACHE_BIN}\"")
+   fi
+ 
++  # Optional address-bar scheme alias (e.g. afree://version). This is an
++  # is_afree-only feature. If is_afree=true is not supplied, ignore
++  # chrome_scheme entirely so the default chrome:// code path is untouched.
++  if [ -n "${chrome_scheme:-}" ]; then
++    if [[ "${extra_gn_args:-}" =~ is_afree[[:space:]]*=[[:space:]]*true ]]; then
++      args+=("chrome_scheme=\"${chrome_scheme}\"")
++    else
++      log "WARNING: ignoring chrome_scheme='${chrome_scheme}' because is_afree=true was not specified"
++    fi
++  fi
++
+   # Extra user-provided gn args are appended LAST so they override the defaults
+   # above (GN's args.gn is evaluated top-to-bottom, last assignment wins).
+   if [ -n "${extra_gn_args:-}" ]; then
+diff --git a/init_tools/build/build_windows_def.sh b/init_tools/build/build_windows_def.sh
+index c1692e084d..5076e3aeb6 100755
+--- a/init_tools/build/build_windows_def.sh
++++ b/init_tools/build/build_windows_def.sh
+@@ -42,6 +42,10 @@ WIN_TARGETS_DEBUG_DEFAULT="chrome"
+ # Disable with --no-ccache.
+ NO_CCACHE_DEFAULT=false
+ 
++# Optional internal chrome:// scheme alias (e.g. "afree"). Empty keeps the
++# upstream chrome:// behaviour. Ignored unless is_afree=true is also passed.
++WIN_CHROME_SCHEME_DEFAULT=""
++
+ # Extra chromium GN args appended verbatim to the generated args
+ # (e.g. "--gn-args='key=value ...'" or "--gn-arg=key=value").
+ WIN_EXTRA_GN_ARGS_DEFAULT=""
+diff --git a/init_tools/build/build_windows_help.sh b/init_tools/build/build_windows_help.sh
+index 18df06db22..c008e92396 100755
+--- a/init_tools/build/build_windows_help.sh
++++ b/init_tools/build/build_windows_help.sh
+@@ -64,6 +64,9 @@ Targets / misc:
+   --dir_fix=<suffix>         Extra suffix appended to the output directory
+   --ccache                   Enable ccache (default)
+   --no-ccache                Disable ccache
++  --chrome-scheme=<name>     Set the afree scheme alias (e.g. afree). Ignored
++                             unless is_afree=true is also passed; empty keeps
++                             chrome:// (default: empty)
+ 
+   -h, --help                 Show this help message
+ 
+@@ -108,6 +111,7 @@ parse_build_params() {
+   dir_fix=""
+   jobs="${WIN_BUILD_JOBS_DEFAULT}"
+   extra_gn_args="${WIN_EXTRA_GN_ARGS_DEFAULT}"
++  chrome_scheme="${WIN_CHROME_SCHEME_DEFAULT}"
+   win_targets=""
+   no_ccache="${NO_CCACHE_DEFAULT}"
+ 
+@@ -135,6 +139,8 @@ parse_build_params() {
+       --no-ccache)                  no_ccache=true ;;
+       --jobs=*)                     jobs="${arg#*=}" ;;
+       --jobs)                       jobs="${1:-}"; shift ;;
++      --chrome-scheme=*|--chrome_scheme=*)
++                                    chrome_scheme="${arg#*=}" ;;
+       --gn-args=*)                  extra_gn_args="${extra_gn_args:+${extra_gn_args} }${arg#*=}" ;;
+       --gn-arg=*)                   extra_gn_args="${extra_gn_args:+${extra_gn_args} }${arg#*=}" ;;
+       -j=*)                         jobs="${arg#*=}" ;;
+-- 
+2.56.1
+
