@@ -1,0 +1,177 @@
+From 81ec36a7f88f8547f6a99b594e5a7cae3dd5fe53 Mon Sep 17 00:00:00 2001
+From: "5455945@gmail.com" <5455945@gmail.com>
+Date: Tue, 24 Nov 2026 17:46:14 +0800
+Subject: [PATCH 7/8] tools: stop linking the post-login page to the Google
+ continue URL
+
+---
+ tools/afree-login-service/README.md           | 23 ++++++++++++++++
+ tools/afree-login-service/src/gaia.mjs        | 27 ++++++++++++++++---
+ tools/afree-login-service/src/views.mjs       | 18 +++++++------
+ .../test/protocol.test.mjs                    | 17 ++++++++++++
+ 4 files changed, 73 insertions(+), 12 deletions(-)
+
+diff --git a/tools/afree-login-service/README.md b/tools/afree-login-service/README.md
+index 9217512157..a3c5258bc0 100644
+--- a/tools/afree-login-service/README.md
++++ b/tools/afree-login-service/README.md
+@@ -476,6 +476,29 @@ instance.
+   CSRF token because the form posts to the same URL; if you embed the service
+   behind a multi-origin front end, add one.
+ 
++## Troubleshooting
++
++**The sign-in tab spins forever after login.** Chromium passes
++`https://www.google.com/` as the `continue` URL. The post-login page only links
++to targets on this service's own origin, so the tab is safe to close - the
++DICE header was already processed and the account is signed in. If you mapped
++the Google hostnames in the hosts file but do not listen on 443 with TLS, any
++navigation to those hostnames hangs until it times out.
++
++**The `sync` token says "Token was revoked".** Chromium is still using the
++default sync URL (`clients4.google.com`). Regenerate `gaia-config.json` (it now
++contains `sync_url`) or start the client with
++`--sync-url=http://<host>:<port>`.
++
++**Sign-in is disabled / "Not Consented for Sync".** Sign-in being disabled
++means the OAuth client is not configured - use the `api_keys` block from
++`gen-gaia-config`. "Not Consented for Sync" just means the sync toggle is off;
++enable it in `afree://settings/syncSetup`.
++
++**Nothing shows up in the sync tables.** Start the service with
++`--log-level debug` and watch for `sync: get updates` / `sync: commit`; then
++check `afree://sync-internals` for the sync URL and the last error.
++
+ ## Roadmap
+ 
+ 1. Sync invalidations (push) instead of polling; conflict detection.
+diff --git a/tools/afree-login-service/src/gaia.mjs b/tools/afree-login-service/src/gaia.mjs
+index 7bb1f208ec..d84d1a9406 100644
+--- a/tools/afree-login-service/src/gaia.mjs
++++ b/tools/afree-login-service/src/gaia.mjs
+@@ -334,9 +334,26 @@ export class GaiaService {
+     return url.toString();
+   }
+ 
++  /**
++   * Returns true when `url` is on this service's own origin. Only same-origin
++   * targets are offered as links on the post-login page: Chromium passes the
++   * Google base URL as `continue`, which is unreachable in a self-hosted or
++   * hosts-mapped deployment and would leave the tab hanging.
++   * @param {string | null} url
++   */
++  isSameOrigin(url) {
++    if (!url) {
++      return false;
++    }
++    try {
++      return new URL(url).origin === this.config.publicUrl;
++    } catch {
++      return false;
++    }
++  }
++
+   /** @param {import('node:http').IncomingMessage} req */
+-  clientInfo(req) {
+-    return {
++  clientInfo(req) {    return {
+       ip: req.socket.remoteAddress ?? '',
+       userAgent: String(req.headers['user-agent'] ?? ''),
+     };
+@@ -764,7 +781,7 @@ export class GaiaService {
+         renderSignedInPage({
+           email: user.display_email,
+           gaiaId: user.gaia_id,
+-          continueUrl: target ?? '',
++          continueUrl: this.isSameOrigin(target) ? target ?? '' : '',
+         }),
+         headers,
+     );
+@@ -1234,7 +1251,9 @@ export class GaiaService {
+       redirect(res, target, headers);
+       return;
+     }
+-    sendHtml(res, 200, renderSignedOutPage({continueUrl: target ?? ''}), headers);
++    sendHtml(res, 200, renderSignedOutPage({
++      continueUrl: this.isSameOrigin(target) ? target ?? '' : '',
++    }), headers);
+   }
+ 
+   /**
+diff --git a/tools/afree-login-service/src/views.mjs b/tools/afree-login-service/src/views.mjs
+index 0491d89800..639862d91d 100644
+--- a/tools/afree-login-service/src/views.mjs
++++ b/tools/afree-login-service/src/views.mjs
+@@ -223,9 +223,7 @@ export function renderSignedInPage({
+   serviceName = 'afree',
+ }) {
+   const continueLink = continueUrl ?
+-      `<div class="actions">
+-         <a class="primary" href="${escapeHtml(continueUrl)}">继续 / Continue</a>
+-       </div>` :
++      `<a class="primary" href="${escapeHtml(continueUrl)}">继续 / Continue</a>` :
+       '';
+   return layout({
+     title: `已登录 ${serviceName}`,
+@@ -236,7 +234,10 @@ Chromium already received the credentials; you can close this tab.</p>
+   <dt>账号 / Account</dt><dd>${escapeHtml(email)}</dd>
+   <dt>Gaia ID</dt><dd>${escapeHtml(gaiaId)}</dd>
+ </dl>
+-${continueLink}`,
++<div class="actions">
++  ${continueLink}
++  <a href="/">状态页 / Status page</a>
++</div>`,
+   });
+ }
+ 
+@@ -301,16 +302,17 @@ ${errorBlock}
+  */
+ export function renderSignedOutPage({continueUrl = '', serviceName = 'afree'}) {
+   const continueLink = continueUrl ?
+-      `<div class="actions">
+-         <a class="primary" href="${escapeHtml(continueUrl)}">继续 / Continue</a>
+-       </div>` :
++      `<a class="primary" href="${escapeHtml(continueUrl)}">继续 / Continue</a>` :
+       '';
+   return layout({
+     title: `已退出 ${serviceName}`,
+     body: `<h1>已退出 / Signed out</h1>
+ <p class="subtitle">本机的 ${escapeHtml(serviceName)} 登录 cookie 已清除。<br>
+ The ${escapeHtml(serviceName)} sign-in cookies have been cleared.</p>
+-${continueLink}`,
++<div class="actions">
++  ${continueLink}
++  <a href="/">状态页 / Status page</a>
++</div>`,
+   });
+ }
+ 
+diff --git a/tools/afree-login-service/test/protocol.test.mjs b/tools/afree-login-service/test/protocol.test.mjs
+index 2b4b2c4527..91020df082 100644
+--- a/tools/afree-login-service/test/protocol.test.mjs
++++ b/tools/afree-login-service/test/protocol.test.mjs
+@@ -377,3 +377,20 @@ test('logout clears cookies and emits the signout header', async () => {
+   });
+   assert.deepEqual(decodeListAccountsResponseBase64(list.text), []);
+ });
++
++test('post-login page never links to an unreachable Google continue URL', async () => {
++  const response = await request('/signin/chrome/sync?ssp=1', {
++    method: 'POST',
++    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
++    body: new URLSearchParams({
++      email: EMAIL,
++      password: PASSWORD,
++      continue: 'https://www.google.com/',
++    }).toString(),
++  });
++  assert.equal(response.status, 200);
++  // The DICE header must still be there; only the dead link is dropped.
++  assert.ok(response.headers.get('x-chrome-id-consistency-response'));
++  assert.ok(!response.text.includes('www.google.com'));
++  assert.match(response.text, /状态页 \/ Status page/);
++});
+-- 
+2.56.1
+

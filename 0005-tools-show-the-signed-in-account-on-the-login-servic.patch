@@ -1,0 +1,260 @@
+From d9b0429c8d93d5955850d094251b8be09e43f81d Mon Sep 17 00:00:00 2001
+From: "5455945@gmail.com" <5455945@gmail.com>
+Date: Tue, 24 Nov 2026 17:08:29 +0800
+Subject: [PATCH 5/8] tools: show the signed-in account on the login service
+ pages
+
+---
+ tools/afree-login-service/README.md           | 20 +++++
+ tools/afree-login-service/src/gaia.mjs        | 73 ++++++++++++++++++-
+ tools/afree-login-service/src/views.mjs       | 36 ++++++++-
+ .../test/protocol.test.mjs                    | 24 ++++++
+ 4 files changed, 151 insertions(+), 2 deletions(-)
+
+diff --git a/tools/afree-login-service/README.md b/tools/afree-login-service/README.md
+index e2798889fe..ad1d9f4a73 100644
+--- a/tools/afree-login-service/README.md
++++ b/tools/afree-login-service/README.md
+@@ -196,6 +196,7 @@ in on one origin, switching to the other requires signing in again.
+ | GET/POST | `/oauth2/v2/tokeninfo` | Token introspection |
+ | POST | `/oauth/multilogin` | Cookie propagation (`)]}'` prefixed JSON) |
+ | GET | `/GetCheckConnectionInfo` | `[]` |
++| GET | `/api/session` | Current browser session as JSON (reads the `SID` cookie) |
+ | GET/POST | `/enable_sync` | `action=ENABLE_SYNC` DICE header |
+ | GET/POST | `/Logout` | Clear cookies + `Google-Accounts-SignOut` header |
+ | POST | `/o/oauth2/revoke` | Revoke a refresh token |
+@@ -326,6 +327,25 @@ node --disable-warning=ExperimentalWarning --test test/*.test.mjs
+ `ListAccounts` encoding, token exchange, single-use codes, userinfo,
+ MultiBearer multilogin, ENABLE_SYNC and logout.
+ 
++## Page login state
++
++`GET /` and `GET /api/session` read the same `SID` cookie that Chromium's
++sign-in flow creates. If the browser is signed in, the status page shows the
++account and `/api/session` returns:
++
++```json
++{
++  "signedIn": true,
++  "primary": {"email": "test@example.com", "gaiaId": "…", "primary": true},
++  "accounts": [{"email": "test@example.com", "position": 0, "primary": true}],
++  "session": {"createdAt": 0, "expiresAt": 0, "deviceName": "", "ip": "…"}
++}
++```
++
++This is only the **login state of this service's origin**. It does not make
++`google.com` show the account (different cookie domain), and it is not Chrome
++Sync. Bookmark/history sync needs a separate `--sync-url` backend.
++
+ ## Current limitations
+ 
+ - **Sync (bookmarks, history, …) is not implemented.** Sign-in works and the
+diff --git a/tools/afree-login-service/src/gaia.mjs b/tools/afree-login-service/src/gaia.mjs
+index 5981f94269..7bb1f208ec 100644
+--- a/tools/afree-login-service/src/gaia.mjs
++++ b/tools/afree-login-service/src/gaia.mjs
+@@ -320,7 +320,7 @@ export class GaiaService {
+     }
+     let url;
+     try {
+-      url = new URL(raw);
++      url = new URL(raw, this.config.publicUrl);
+     } catch {
+       return null;
+     }
+@@ -514,6 +514,11 @@ export class GaiaService {
+         return;
+       }
+ 
++      if (path === '/api/session' && method === 'GET') {
++        this.handleSessionInfo(req, res);
++        return;
++      }
++
+       if (path === '/favicon.ico') {
+         res.writeHead(204);
+         res.end();
+@@ -521,13 +526,32 @@ export class GaiaService {
+       }
+ 
+       if (path === '/' && method === 'GET') {
++        const session = this.getSession(req);
++        /** @type {{displayEmail: string, gaiaId: string, displayName: string, position: number}[]} */
++        let accounts = [];
++        if (session) {
++          accounts = this.store.getSessionAccounts(session.id)
++                         .filter((entry) => !entry.disabled)
++                         .map((entry) => ({
++                                displayEmail: entry.display_email,
++                                gaiaId: entry.gaia_id,
++                                displayName: entry.display_name,
++                                position: entry.position,
++                              }));
++          this.store.touchSession(session.id);
++        }
++        const account =
++            accounts.find((entry) => entry.position === 0) ?? accounts[0] ?? null;
+         sendHtml(
+             res,
+             200,
+             renderIndexPage({
+               publicUrl: this.config.publicUrl,
+               serviceName: 'afree',
++              account,
++              accounts,
+             }),
++            {'Cache-Control': 'no-store'},
+         );
+         return;
+       }
+@@ -748,6 +772,53 @@ export class GaiaService {
+ 
+   // ----------------------------------------------------------- endpoints
+ 
++  /**
++   * Returns the accounts attached to the browser session as JSON. This is the
++   * "page login state" view: it reads the same SID cookie Chromium uses, so a
++   * browser that signed in through the profile menu shows up here too.
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   */
++  handleSessionInfo(req, res) {
++    const session = this.getSession(req);
++    if (!session) {
++      sendJson(
++          res,
++          200,
++          {signedIn: false, primary: null, accounts: []},
++          {'Cache-Control': 'no-store'},
++      );
++      return;
++    }
++    const accounts = this.store.getSessionAccounts(session.id)
++                         .filter((entry) => !entry.disabled)
++                         .map((entry) => ({
++                                email: entry.display_email,
++                                gaiaId: entry.gaia_id,
++                                displayName: entry.display_name,
++                                avatarUrl: entry.avatar_url,
++                                position: entry.position,
++                                primary: entry.position === 0,
++                              }));
++    sendJson(
++        res,
++        200,
++        {
++          signedIn: accounts.length > 0,
++          primary: accounts.find((entry) => entry.primary) ?? accounts[0] ??
++              null,
++          accounts,
++          session: {
++            createdAt: session.created_at,
++            expiresAt: session.expires_at,
++            deviceName: session.device_name,
++            ip: session.ip,
++          },
++        },
++        {'Cache-Control': 'no-store'},
++    );
++  }
++
+   /**
+    * Mirrors the /enable_sync endpoint used by Chromium's dice browsertest:
+    * it answers with action=ENABLE_SYNC so the client can finish the sync
+diff --git a/tools/afree-login-service/src/views.mjs b/tools/afree-login-service/src/views.mjs
+index e7a9c8701b..0491d89800 100644
+--- a/tools/afree-login-service/src/views.mjs
++++ b/tools/afree-login-service/src/views.mjs
+@@ -318,12 +318,45 @@ ${continueLink}`,
+  * @param {object} options
+  * @param {string} options.publicUrl
+  * @param {string} options.serviceName
++ * @param {object | null} [options.account]
++ * @param {string} [options.account.displayEmail]
++ * @param {string} [options.account.gaiaId]
++ * @param {string} [options.account.displayName]
++ * @param {object[]} [options.accounts]
++ * @param {string} [options.accounts[].displayEmail]
++ * @param {number} [options.accounts[].position]
+  */
+-export function renderIndexPage({publicUrl, serviceName}) {
++export function renderIndexPage({
++  publicUrl,
++  serviceName,
++  account = null,
++  accounts = [],
++}) {
++  const sessionBlock = account ?
++      `<p class="notice">当前已登录 / Signed in as
++  <strong>${escapeHtml(account.displayEmail)}</strong></p>
++<dl>
++  <dt>账号 / Account</dt><dd>${escapeHtml(account.displayEmail)}</dd>
++  <dt>Gaia ID</dt><dd>${escapeHtml(account.gaiaId)}</dd>
++  ${account.displayName ? `<dt>名称 / Name</dt><dd>${
++      escapeHtml(account.displayName)}</dd>` : ''}
++</dl>
++${accounts.length > 1 ? `<ul class="endpoints">
++  ${accounts.map((entry) => `<li>${escapeHtml(entry.displayEmail)}${
++      entry.position === 0 ? ' — 主账号 / primary' : ''}</li>`).join('\n  ')}
++</ul>` : ''}
++<div class="actions">
++  <a href="/Logout?continue=/">退出登录 / Sign out</a>
++</div>` :
++      `<p class="notice">当前未登录 / Not signed in</p>
++<div class="actions">
++  <a class="primary" href="/signin/chrome/sync?continue=/">登录 / Sign in</a>
++</div>`;
+   return layout({
+     title: `${serviceName} login service`,
+     body: `<h1>${escapeHtml(serviceName)} 登录服务</h1>
+ <p class="subtitle">Gaia-compatible sign-in endpoint for Chromium/afree.</p>
++${sessionBlock}
+ <dl>
+   <dt>Origin</dt><dd>${escapeHtml(publicUrl)}</dd>
+   <dt>Status</dt><dd>running</dd>
+@@ -334,6 +367,7 @@ export function renderIndexPage({publicUrl, serviceName}) {
+   <li><code>POST /oauth2/v4/token</code> — OAuth2 token exchange</li>
+   <li><code>GET /oauth2/v1/userinfo</code> — user profile</li>
+   <li><code>POST /oauth/multilogin</code> — cookie propagation</li>
++  <li><code>GET /api/session</code> — current browser session (JSON)</li>
+   <li><code>GET /GetCheckConnectionInfo</code> — connection info</li>
+   <li><code>GET /Logout</code> — sign-out</li>
+ </ul>
+diff --git a/tools/afree-login-service/test/protocol.test.mjs b/tools/afree-login-service/test/protocol.test.mjs
+index fb1294931f..2b4b2c4527 100644
+--- a/tools/afree-login-service/test/protocol.test.mjs
++++ b/tools/afree-login-service/test/protocol.test.mjs
+@@ -333,6 +333,30 @@ test('GetCheckConnectionInfo is an empty JSON list', async () => {
+   assert.deepEqual(JSON.parse(response.text), []);
+ });
+ 
++test('index page and /api/session reflect the browser login', async () => {
++  const page = await request('/', {headers: {Cookie: cookieHeader()}});
++  assert.equal(page.status, 200);
++  assert.ok(page.text.includes(EMAIL), 'index page does not show the account');
++  assert.match(page.text, /已登录 \/ Signed in as/);
++
++  const info = await request('/api/session', {
++    headers: {Cookie: cookieHeader()},
++  });
++  const payload = JSON.parse(info.text);
++  assert.equal(payload.signedIn, true);
++  assert.equal(payload.primary.email, EMAIL);
++  assert.equal(payload.primary.gaiaId, gaiaId);
++  assert.equal(payload.accounts.length, 1);
++  assert.equal(payload.accounts[0].primary, true);
++});
++
++test('index page and /api/session show signed out without cookies', async () => {
++  const page = await request('/');
++  assert.match(page.text, /未登录 \/ Not signed in/);
++  const info = await request('/api/session');
++  assert.equal(JSON.parse(info.text).signedIn, false);
++});
++
+ test('logout clears cookies and emits the signout header', async () => {
+   const response = await request('/Logout?source=chrome', {
+     headers: {Cookie: cookieHeader()},
+-- 
+2.56.1
+

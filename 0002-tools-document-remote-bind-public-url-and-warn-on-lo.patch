@@ -1,0 +1,125 @@
+From 4243dcacec94e843bf82f6f6b955212e3639cd2a Mon Sep 17 00:00:00 2001
+From: "5455945@gmail.com" <5455945@gmail.com>
+Date: Tue, 24 Nov 2026 16:39:33 +0800
+Subject: [PATCH 2/8] tools: document remote bind/public-url and warn on
+ loopback mismatch
+
+---
+ tools/afree-login-service/README.md      | 60 ++++++++++++++++++++++++
+ tools/afree-login-service/src/server.mjs | 20 ++++++++
+ 2 files changed, 80 insertions(+)
+
+diff --git a/tools/afree-login-service/README.md b/tools/afree-login-service/README.md
+index 8a44a57b06..d7297ce78b 100644
+--- a/tools/afree-login-service/README.md
++++ b/tools/afree-login-service/README.md
+@@ -124,6 +124,66 @@ node src/server.mjs \
+ Then point Chromium at `https://login.example.com`. With a self-signed
+ certificate, add `--ignore-certificate-errors` for testing.
+ 
++## Accessing from another machine
++
++`--host` is only the **bind address**. `--public-url` is the origin that ends
++up in cookies, in `id_token.iss` and in the status page, so it must be an
++address the client can actually reach.
++
++Three values must be the same origin:
++
++1. `--public-url`
++2. the `--url` you pass to `gen-gaia-config`
++3. the address the browser connects to
++
++Example for a machine with LAN address `192.168.1.23`:
++
++```sh
++ip -4 addr show | grep 'inet '        # find the reachable address
++
++cd tools/afree-login-service
++node src/server.mjs --host 0.0.0.0 --port 8080 \
++  --public-url http://192.168.1.23:8080
++
++# in another shell, generate the client config for the same origin
++node src/cli.mjs gen-gaia-config --url http://192.168.1.23:8080 \
++  > gaia-config.json
++
++# verify from the client machine
++curl http://192.168.1.23:8080/healthz
++```
++
++Open the firewall if needed:
++
++```sh
++sudo ufw allow 8080/tcp
++# or
++sudo firewall-cmd --add-port=8080/tcp --permanent && sudo firewall-cmd --reload
++```
++
++If this machine is a VM behind NAT, also forward the port on the hypervisor
++(host `8080` -> guest `8080`), and use the address/hostname the client can see.
++
++Run it detached:
++
++```sh
++nohup node src/server.mjs --host 0.0.0.0 --port 8080 \
++  --public-url http://192.168.1.23:8080 > server.log 2>&1 &
++```
++
++Across the Internet, terminate TLS in front (nginx, Caddy, …) and use the
++public hostname, then regenerate the client config with the same URL:
++
++```sh
++node src/server.mjs --public-url https://login.example.com
++node src/cli.mjs gen-gaia-config --url https://login.example.com \
++  > gaia-config.json
++```
++
++Cookies are host-only, so `http://127.0.0.1:8080` and
++`http://192.168.1.23:8080` are different registrations: if you already signed
++in on one origin, switching to the other requires signing in again.
++
+ ## Endpoints
+ 
+ | Method | Path | Purpose |
+diff --git a/tools/afree-login-service/src/server.mjs b/tools/afree-login-service/src/server.mjs
+index 6b918f440d..0f7a5abc2b 100644
+--- a/tools/afree-login-service/src/server.mjs
++++ b/tools/afree-login-service/src/server.mjs
+@@ -65,6 +65,18 @@ async function main() {
+     }
+   }
+ 
++  // Binding a wildcard/non-loopback address while advertising a loopback
++  // origin is almost always a mistake: cookies are host-only, so remote
++  // clients would receive cookies for a host they never talk to.
++  if (!isLoopbackHost(config.host) &&
++      isLoopbackHost(new URL(config.publicUrl).hostname)) {
++    logger.warn(
++        '--host is not loopback but --public-url points at loopback; remote ' +
++        'clients will not be able to use this origin. Pass --public-url ' +
++        'http://<this-machine-ip>:<port> (and regenerate the gaia config ' +
++        'with the same URL).');
++  }
++
+   const {server, store} = await startServer(config, logger);
+   const address = server.address();
+   const actualPort =
+@@ -77,8 +89,16 @@ async function main() {
+   });
+ 
+   process.stdout.write(`afree login service listening on ${config.publicUrl}
++bind address: ${config.host}:${actualPort}
+ database: ${config.dbPath}
+ 
++Clients on this machine can use ${config.publicUrl} directly.
++Clients on another machine need the address they can reach, for example:
++  node src/server.mjs --host 0.0.0.0 --port ${actualPort} \\
++    --public-url http://<this-machine-ip>:${actualPort}
++  node src/cli.mjs gen-gaia-config --url http://<this-machine-ip>:${actualPort} \\
++    > gaia-config.json
++
+ Next steps:
+   1) create a user:
+        node src/cli.mjs add-user --email you@example.com
+-- 
+2.56.1
+

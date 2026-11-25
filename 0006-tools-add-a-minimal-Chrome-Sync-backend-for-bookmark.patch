@@ -1,0 +1,2165 @@
+From c8492df8f98c4ffd9a7f205b12fbd509e6671cea Mon Sep 17 00:00:00 2001
+From: "5455945@gmail.com" <5455945@gmail.com>
+Date: Tue, 24 Nov 2026 17:21:52 +0800
+Subject: [PATCH 6/8] tools: add a minimal Chrome Sync backend for bookmarks
+
+Serve Chromium's sync endpoint at POST .../command/ on the same origin as
+the Gaia-compatible login service, so a client that signs in to the local
+account can also sync bookmarks.
+
+Protocol details follow the tree:
+  * /command/ path and gzip request bodies
+    (components/sync/engine/sync_manager_impl.cc,
+     components/sync/engine/net/http_bridge.cc)
+  * ClientToServerMessage / ClientToServerResponse / SyncEntity
+    (components/sync/protocol/sync.proto, sync_entity.proto)
+  * permanent bookmark folders and server ids
+    (components/sync/engine/loopback_server/)
+
+Implementation:
+  * src/pb.mjs: dependency-free protobuf wire codec (incl. proto2 groups)
+  * src/sync-store.mjs: per-account store, monotonic versions, permanent
+    entities, clear-on-demand
+  * src/sync.mjs: GetUpdates, Commit, ClearServerData, /event
+  * EntitySpecifics are stored opaquely, so bookmarks (and unencrypted
+    other datatypes) round-trip without server-side schema knowledge
+  * persistent 16-byte keystore key returned in encryption_keys
+  * gaia-config now contains sync_url; --sync-url also works
+  * optional TLS (--tls-cert/--tls-key) for hosts-mapping deployments
+
+Tests: 10 new end-to-end sync tests (27 total).
+---
+ tools/afree-login-service/.gitignore         |   1 +
+ tools/afree-login-service/README.md          | 118 +++-
+ tools/afree-login-service/src/cli.mjs        |   3 +
+ tools/afree-login-service/src/config.mjs     |   8 +
+ tools/afree-login-service/src/pb.mjs         | 298 +++++++++
+ tools/afree-login-service/src/schema.sql     |  44 ++
+ tools/afree-login-service/src/server.mjs     |  32 +-
+ tools/afree-login-service/src/sync-store.mjs | 306 +++++++++
+ tools/afree-login-service/src/sync.mjs       | 655 +++++++++++++++++++
+ tools/afree-login-service/test/sync.test.mjs | 460 +++++++++++++
+ 10 files changed, 1911 insertions(+), 14 deletions(-)
+ create mode 100644 tools/afree-login-service/src/pb.mjs
+ create mode 100644 tools/afree-login-service/src/sync-store.mjs
+ create mode 100644 tools/afree-login-service/src/sync.mjs
+ create mode 100644 tools/afree-login-service/test/sync.test.mjs
+
+diff --git a/tools/afree-login-service/.gitignore b/tools/afree-login-service/.gitignore
+index 28c3912dd0..f751c91907 100644
+--- a/tools/afree-login-service/.gitignore
++++ b/tools/afree-login-service/.gitignore
+@@ -4,3 +4,4 @@ data/
+ *.sqlite3-shm
+ node_modules/
+ gaia-config.json
++server.log
+diff --git a/tools/afree-login-service/README.md b/tools/afree-login-service/README.md
+index ad1d9f4a73..9217512157 100644
+--- a/tools/afree-login-service/README.md
++++ b/tools/afree-login-service/README.md
+@@ -123,6 +123,40 @@ node src/server.mjs \
+ Then point Chromium at `https://login.example.com`. With a self-signed
+ certificate, add `--ignore-certificate-errors` for testing.
+ 
++### Keeping the real Google domains (hosts mapping)
++
++Instead of overriding the URLs, you can map the Google hostnames to this
++machine in the client's hosts file:
++
++```text
++172.31.31.29  accounts.google.com
++172.31.31.29  www.googleapis.com
++172.31.31.29  clients4.google.com
++172.31.31.29  google.com
++172.31.31.29  www.google.com
++```
++
++Serve HTTPS on 443 with a certificate that has SANs for
++`accounts.google.com`, `www.googleapis.com` and `clients4.google.com`:
++
++```sh
++node src/server.mjs --host 0.0.0.0 --port 443 \
++  --public-url https://accounts.google.com \
++  --tls-cert cert.pem --tls-key key.pem
++```
++
++- Trust your local CA on the client, or start Chromium with
++  `--ignore-certificate-errors`.
++- No `--gaia-config` is needed: the default URLs already resolve to the hosts
++  entries.
++- Unbranded Chromium uses `https://clients4.google.com/chrome-sync/dev` for
++  sync; the server accepts any `.../command/` path.
++- Sign-in cookies are host-only for `accounts.google.com`; token calls use
++  `www.googleapis.com`.
++
++Using `--gaia-config` with `http://<ip>:<port>` remains the simplest option
++because it needs neither hosts entries nor certificates.
++
+ ## Accessing from another machine
+ 
+ `--host` is only the **bind address**. `--public-url` is the origin that ends
+@@ -195,6 +229,8 @@ in on one origin, switching to the other requires signing in again.
+ | GET/POST | `/oauth2/v1/userinfo` | Profile for a Bearer access token |
+ | GET/POST | `/oauth2/v2/tokeninfo` | Token introspection |
+ | POST | `/oauth/multilogin` | Cookie propagation (`)]}'` prefixed JSON) |
++| POST | `/command/` | Chrome Sync: `GetUpdates` / `Commit` / `ClearServerData` (gzip protobuf) |
++| POST | `/event/` | Chrome Sync "sync stopped" report |
+ | GET | `/GetCheckConnectionInfo` | `[]` |
+ | GET | `/api/session` | Current browser session as JSON (reads the `SID` cookie) |
+ | GET/POST | `/enable_sync` | `action=ENABLE_SYNC` DICE header |
+@@ -223,7 +259,8 @@ in on one origin, switching to the other requires signing in again.
+     "account_capabilities_origin_url": {"url": "http://127.0.0.1:8080"},
+     "people_api_origin_url":  {"url": "http://127.0.0.1:8080"},
+     "classroom_api_origin_url": {"url": "http://127.0.0.1:8080"},
+-    "tasks_api_origin_url":   {"url": "http://127.0.0.1:8080"}
++    "tasks_api_origin_url":   {"url": "http://127.0.0.1:8080"},
++    "sync_url":               {"url": "http://127.0.0.1:8080"}
+   },
+   "api_keys": {
+     "GOOGLE_DEFAULT_CLIENT_ID":     "afree-client-id",
+@@ -244,6 +281,9 @@ Why each key matters:
+ - `google_apis_origin_url` — `/oauth2/v4/token`, `/oauth2/v1/userinfo`,
+   `/oauth2/v2/tokeninfo`.
+ - `lso_origin_url` — `/o/oauth2/revoke`.
++- `sync_url` — Chrome Sync; Chromium appends `/command/` to it
++  (`components/sync/base/sync_util.cc`). Equivalent to
++  `--sync-url=http://<host>:<port>`.
+ - `api_keys` — enables DICE at all (see the warning above).
+ 
+ ## Accounts, sessions and tokens
+@@ -297,6 +337,8 @@ All commands accept `--db <path>`; the default is `data/afree-login.sqlite3`.
+ --redirect-continue             # redirect to ?continue= like Google Gaia
+ --allowed-continue-hosts a,b    # allowlist for ?continue=
+ --no-oauth-code-cookie          # drop the legacy oauth_code cookie
++--tls-cert cert.pem             # serve HTTPS (with --tls-key)
++--tls-key key.pem
+ ```
+ 
+ Environment variables use the `AFREE_LOGIN_` prefix
+@@ -312,7 +354,8 @@ sign-in itself completes through the DICE header either way. Pass
+ 
+ SQLite (WAL) through `node:sqlite`; in this tree that is SQLite **3.50.4**.
+ Tables: `users`, `sessions`, `session_accounts`, `auth_codes`,
+-`refresh_tokens`, `access_tokens`, `audit_log`, `meta`.
++`refresh_tokens`, `access_tokens`, `audit_log`, `sync_stores`,
++`sync_entities`, `meta`.
+ 
+ The schema is applied idempotently at startup (`src/schema.sql`). `STRICT`
+ tables and `PRAGMA foreign_keys = ON` are enabled.
+@@ -323,9 +366,10 @@ tables and `PRAGMA foreign_keys = ON` are enabled.
+ node --disable-warning=ExperimentalWarning --test test/*.test.mjs
+ ```
+ 
+-15 protocol tests cover the DICE header, cookie issuance, binary
++27 protocol tests cover the DICE header, cookie issuance, binary
+ `ListAccounts` encoding, token exchange, single-use codes, userinfo,
+-MultiBearer multilogin, ENABLE_SYNC and logout.
++MultiBearer multilogin, ENABLE_SYNC, logout, and the Chrome Sync
++`GetUpdates` / `Commit` / `ClearServerData` flow.
+ 
+ ## Page login state
+ 
+@@ -343,14 +387,67 @@ account and `/api/session` returns:
+ ```
+ 
+ This is only the **login state of this service's origin**. It does not make
+-`google.com` show the account (different cookie domain), and it is not Chrome
+-Sync. Bookmark/history sync needs a separate `--sync-url` backend.
++`google.com` show the account (different cookie domain).
++
++## Chrome Sync (bookmarks)
++
++The same process also serves Chromium's sync endpoint at `POST /command/`.
++Chromium appends `/command/` to the sync URL
++(`components/sync/engine/sync_manager_impl.cc`), so pointing `sync_url` (or
++`--sync-url`) at the service is enough:
++
++```sh
++# gaia-config already includes it; or explicitly:
++afree --sync-url=http://172.31.31.29:8080 ...
++```
++
++Implemented:
++
++- `GetUpdates` with per-datatype progress markers (opaque tokens are the
++  decimal entity version), batched at 500 entities per datatype.
++- `Commit` with server-assigned ids: bookmarks become `32904_<guid>`.
++- Server-created permanent bookmark folders (`bookmark_bar`,
++  `other_bookmarks`, `synced_bookmarks`) plus the bookmark and nigori roots,
++  matched by `server_defined_unique_tag`.
++- Tombstones, including cascading deletes when a folder is deleted.
++- `ClearServerData` rotates `store_birthday` and re-creates permanent entities.
++- `encryption_keys`: a persistent 16-byte keystore key so the client can
++  establish its Nigori key.
++- gzip request bodies and `Authorization: Bearer <access token>`.
++
++`EntitySpecifics` is stored as an opaque blob and echoed back, so the server
++does not need to understand each datatype. Bookmarks are not encrypted with the
++default keystore passphrase
++(`EncryptionPolicy::kEncryptedIfCustomPassphraseSet` in
++`components/sync/base/data_type.cc`), which is why the payload round-trips
++unchanged. Types such as preferences, theme or extensions also round-trip as
++long as their specifics are not encrypted.
++
++To try it:
++
++1. Sign in with a local account.
++2. Open `afree://settings/syncSetup` and turn sync on.
++3. Add or edit a bookmark, then check `afree://sync-internals`.
++4. Inspect the server side with `sqlite3 data/afree-login.sqlite3
++   'select id, name, version, deleted from sync_entities'`.
++
++Limits:
++
++- **Polling only** — no invalidation hints, so remote changes show up on the
++  next sync cycle.
++- **Last-write-wins**: no version conflict detection.
++- **Type-specific validation is absent**; the server never parses bookmark
++  URLs or titles.
++- If a **custom passphrase** is enabled, non-bookmark datatypes carry no
++  datatype information and are rejected; bookmarks still work because their
++  parent id carries the type.
++- History and passwords should be treated as unsupported.
+ 
+ ## Current limitations
+ 
+-- **Sync (bookmarks, history, …) is not implemented.** Sign-in works and the
+-  refresh token can be used later for a `--sync-url` backend. Without one,
+-  `afree://sync-internals` shows the account but sync stays disabled.
++- **Chrome Sync is minimal.** Bookmarks work end to end (see above), but there
++  are no invalidations, no conflict detection, no datatype-specific validation,
++  and encrypted non-bookmark datatypes are rejected.
+ - **DBSC / `RotateBoundCookies`** is not implemented (returns `400`).
+   `eligible_for_token_binding` is deliberately omitted.
+ - **Reauth** (`AccountChooser`, `/reauth/v1beta/...`) is a stub.
+@@ -381,8 +478,7 @@ instance.
+ 
+ ## Roadmap
+ 
+-1. `--sync-url` compatible backend for bookmarks/preferences (protobuf
+-   `SyncEntity`, `/command` endpoints).
++1. Sync invalidations (push) instead of polling; conflict detection.
+ 2. Multi-account cookie families and per-account sign-out.
+ 3. Device-bound sessions (`RotateBoundCookies`, DBSC).
+ 4. Password change / account chooser pages.
+diff --git a/tools/afree-login-service/src/cli.mjs b/tools/afree-login-service/src/cli.mjs
+index 4a69594fcb..11bad76345 100644
+--- a/tools/afree-login-service/src/cli.mjs
++++ b/tools/afree-login-service/src/cli.mjs
+@@ -134,6 +134,9 @@ function buildGaiaConfig(url, clientId, clientSecret) {
+       people_api_origin_url: {url: origin},
+       classroom_api_origin_url: {url: origin},
+       tasks_api_origin_url: {url: origin},
++      // Chrome Sync: components/sync/base/sync_util.cc reads `sync_url` from
++      // the gaia config and appends "/command/".
++      sync_url: {url: origin},
+     },
+     api_keys: {
+       GOOGLE_DEFAULT_CLIENT_ID: clientId,
+diff --git a/tools/afree-login-service/src/config.mjs b/tools/afree-login-service/src/config.mjs
+index 6c8b22727d..898d21107a 100644
+--- a/tools/afree-login-service/src/config.mjs
++++ b/tools/afree-login-service/src/config.mjs
+@@ -32,6 +32,8 @@ export function isLoopbackHost(host) {
+  * @property {string[]} allowedContinueHosts
+  * @property {boolean} emitOAuthCodeCookie
+  * @property {boolean} redirectContinue
++ * @property {string} tlsCertPath
++ * @property {string} tlsKeyPath
+  */
+ 
+ /** @type {Config} */
+@@ -55,6 +57,8 @@ export const DEFAULT_CONFIG = {
+   // deployment, so the default here renders the local "signed in" page
+   // instead. The DICE header is sent either way.
+   redirectContinue: false,
++  tlsCertPath: '',
++  tlsKeyPath: '',
+ };
+ 
+ const NUMBER_FLAGS = new Map([
+@@ -70,6 +74,8 @@ const STRING_FLAGS = new Map([
+   ['db', 'dbPath'],
+   ['public-url', 'publicUrl'],
+   ['log-level', 'logLevel'],
++  ['tls-cert', 'tlsCertPath'],
++  ['tls-key', 'tlsKeyPath'],
+ ]);
+ 
+ const ENV_PREFIX = 'AFREE_LOGIN_';
+@@ -180,6 +186,8 @@ Options:
+   --auth-code-ttl <seconds>      Authorization code lifetime (default 300)
+   --session-ttl-days <n>         Browser session lifetime (default 30)
+   --log-level <level>            debug|info|warn|error|silent (default info)
++  --tls-cert <path>              PEM certificate; serve HTTPS when set with
++  --tls-key <path>               the matching private key
+   --allow-registration           Enable the optional /signup page
+   --redirect-continue            Redirect to ?continue= after sign-in like
+                                  Google Gaia does (default: show a local page)
+diff --git a/tools/afree-login-service/src/pb.mjs b/tools/afree-login-service/src/pb.mjs
+new file mode 100644
+index 0000000000..44e994a457
+--- /dev/null
++++ b/tools/afree-login-service/src/pb.mjs
+@@ -0,0 +1,298 @@
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Minimal protobuf wire-format reader/writer.
++//
++// The sync protocol (components/sync/protocol/*.proto) is protobuf over HTTP.
++// Rather than depending on a protobuf runtime and a codegen step, this module
++// implements the wire format directly and treats most nested messages as
++// opaque byte blobs. Only the fields the server actually needs are decoded;
++// everything else (per-datatype `specifics`, unique positions, ...) is stored
++// and echoed back verbatim, which keeps the server datatype-agnostic.
++
++export const WIRE_VARINT = 0;
++export const WIRE_FIXED64 = 1;
++export const WIRE_LENGTH = 2;
++export const WIRE_START_GROUP = 3;
++export const WIRE_END_GROUP = 4;
++export const WIRE_FIXED32 = 5;
++
++/**
++ * Encodes a non-negative integer as a varint.
++ * @param {number|bigint} value
++ * @returns {Buffer}
++ */
++export function encodeVarint(value) {
++  let remaining = typeof value === 'bigint' ? value : BigInt(Math.trunc(value));
++  if (remaining < 0n) {
++    throw new RangeError(`negative varint: ${value}`);
++  }
++  const bytes = [];
++  while (remaining >= 0x80n) {
++    bytes.push(Number(remaining & 0x7fn) | 0x80);
++    remaining >>= 7n;
++  }
++  bytes.push(Number(remaining));
++  return Buffer.from(bytes);
++}
++
++function tag(fieldNumber, wireType) {
++  return encodeVarint((BigInt(fieldNumber) << 3n) | BigInt(wireType));
++}
++
++export class Writer {
++  constructor() {
++    /** @type {Buffer[]} */
++    this.parts = [];
++  }
++
++  /** @param {Buffer} bytes */
++  raw(bytes) {
++    this.parts.push(bytes);
++    return this;
++  }
++
++  /** @param {number} field @param {number|bigint} value */
++  varint(field, value) {
++    this.parts.push(tag(field, WIRE_VARINT), encodeVarint(value));
++    return this;
++  }
++
++  /** @param {number} field @param {boolean} value */
++  bool(field, value) {
++    return this.varint(field, value ? 1 : 0);
++  }
++
++  /** @param {number} field @param {string} value */
++  string(field, value) {
++    const data = Buffer.from(value, 'utf8');
++    this.parts.push(
++        tag(field, WIRE_LENGTH), encodeVarint(data.length), data);
++    return this;
++  }
++
++  /** @param {number} field @param {Buffer} value */
++  bytes(field, value) {
++    this.parts.push(
++        tag(field, WIRE_LENGTH), encodeVarint(value.length), value);
++    return this;
++  }
++
++  /** @param {number} field @param {Buffer} message */
++  message(field, message) {
++    return this.bytes(field, message);
++  }
++
++  /**
++   * Emits a proto2 `group` (used by CommitResponse.EntryResponse).
++   * @param {number} field
++   * @param {(writer: Writer) => void} body
++   */
++  group(field, body) {
++    this.parts.push(tag(field, WIRE_START_GROUP));
++    body(this);
++    this.parts.push(tag(field, WIRE_END_GROUP));
++    return this;
++  }
++
++  /** @returns {Buffer} */
++  finish() {
++    return Buffer.concat(this.parts);
++  }
++}
++
++/**
++ * @typedef {object} Field
++ * @property {number} field
++ * @property {number} wireType
++ * @property {Buffer|number|bigint} value
++ */
++
++/**
++ * Reads the top-level fields of a message.
++ * @param {Buffer} buffer
++ * @returns {Field[]}
++ */
++export function readFields(buffer) {
++  /** @type {Field[]} */
++  const fields = [];
++  let offset = 0;
++  while (offset < buffer.length) {
++    let fieldTag;
++    [fieldTag, offset] = readVarintNumber(buffer, offset);
++    const field = Math.floor(fieldTag / 8);
++    const wireType = fieldTag & 0x7;
++    if (field === 0) {
++      throw new RangeError('invalid field number 0');
++    }
++    switch (wireType) {
++      case WIRE_VARINT: {
++        let value;
++        [value, offset] = readVarintNumber(buffer, offset);
++        fields.push({field, wireType, value});
++        break;
++      }
++      case WIRE_FIXED64: {
++        if (offset + 8 > buffer.length) {
++          throw new RangeError('truncated fixed64');
++        }
++        fields.push({field, wireType, value: buffer.subarray(offset, offset + 8)});
++        offset += 8;
++        break;
++      }
++      case WIRE_LENGTH: {
++        let length;
++        [length, offset] = readVarintNumber(buffer, offset);
++        if (offset + length > buffer.length) {
++          throw new RangeError('truncated length-delimited field');
++        }
++        fields.push({
++          field,
++          wireType,
++          value: buffer.subarray(offset, offset + length),
++        });
++        offset += length;
++        break;
++      }
++      case WIRE_FIXED32: {
++        if (offset + 4 > buffer.length) {
++          throw new RangeError('truncated fixed32');
++        }
++        fields.push({field, wireType, value: buffer.subarray(offset, offset + 4)});
++        offset += 4;
++        break;
++      }
++      case WIRE_START_GROUP: {
++        // Capture the group body so callers can decode proto2 groups
++        // (CommitResponse.EntryResponse uses one).
++        const bodyStart = offset;
++        const endTag = (field << 3) | WIRE_END_GROUP;
++        for (;;) {
++          let innerTag;
++          const innerTagStart = offset;
++          [innerTag, offset] = readVarintNumber(buffer, offset);
++          if (innerTag === endTag) {
++            fields.push({
++              field,
++              wireType,
++              value: buffer.subarray(bodyStart, innerTagStart),
++            });
++            break;
++          }
++          const innerWire = innerTag & 0x7;
++          if (innerWire === WIRE_VARINT) {
++            [, offset] = readVarintNumber(buffer, offset);
++          } else if (innerWire === WIRE_LENGTH) {
++            let length;
++            [length, offset] = readVarintNumber(buffer, offset);
++            offset += length;
++          } else if (innerWire === WIRE_FIXED32) {
++            offset += 4;
++          } else if (innerWire === WIRE_FIXED64) {
++            offset += 8;
++          } else {
++            throw new RangeError(`invalid wire type ${innerWire} in group`);
++          }
++          if (offset > buffer.length) {
++            throw new RangeError('truncated group');
++          }
++        }
++        break;
++      }
++      case WIRE_END_GROUP:
++        // End tags are consumed by the group loop above.
++        throw new RangeError('unexpected end-group tag');
++      default:
++        throw new RangeError(`unsupported wire type ${wireType}`);
++    }
++  }
++  return fields;
++}
++
++function readVarintNumber(buffer, offset) {
++  let value = 0;
++  let multiplier = 1;
++  let index = offset;
++  for (;;) {
++    if (index >= buffer.length) {
++      throw new RangeError('truncated varint');
++    }
++    const byte = buffer[index++];
++    value += (byte & 0x7f) * multiplier;
++    if ((byte & 0x80) === 0) {
++      return [value, index];
++    }
++    multiplier *= 128;
++    if (multiplier > Number.MAX_SAFE_INTEGER) {
++      throw new RangeError('varint too large');
++    }
++  }
++}
++
++/** @param {Field[]} fields @param {number} field @param {number} [wireType] */
++export function fieldValues(fields, field, wireType = WIRE_LENGTH) {
++  return fields
++      .filter((entry) => entry.field === field && entry.wireType === wireType)
++      .map((entry) => entry.value);
++}
++
++/** @param {Field[]} fields @param {number} field @param {number} [wireType] */
++export function firstField(fields, field, wireType = WIRE_LENGTH) {
++  const match =
++      fields.find((entry) => entry.field === field && entry.wireType === wireType);
++  return match ? match.value : null;
++}
++
++/** @param {Field[]} fields @param {number} field */
++export function firstNumber(fields, field) {
++  const value = firstField(fields, field, WIRE_VARINT);
++  return value === null ? null : Number(value);
++}
++
++/** @param {Field[]} fields @param {number} field */
++export function firstString(fields, field) {
++  const value = firstField(fields, field, WIRE_LENGTH);
++  return value === null ? null : value.toString('utf8');
++}
++
++/** @param {Field[]} fields @param {number} field */
++export function firstBool(fields, field) {
++  const value = firstNumber(fields, field);
++  return value === null ? null : value !== 0;
++}
++
++/** @param {Buffer} buffer */
++export function decodeMessage(buffer) {
++  return readFields(buffer);
++}
++
++/**
++ * Returns the field number of the first field of `EntitySpecifics`, which is
++ * how Chromium identifies a datatype (`specifics_variant_case()`).
++ * @param {Buffer} specifics
++ */
++export function entitySpecificsType(specifics) {
++  if (!specifics || specifics.length === 0) {
++    return 0;
++  }
++  try {
++    for (const entry of readFields(specifics)) {
++      return entry.field;
++    }
++  } catch {
++    return 0;
++  }
++  return 0;
++}
++
++/**
++ * Builds an `EntitySpecifics` with the datatype's oneof field present but
++ * empty, e.g. for tombstones and permanent folders.
++ * @param {number} dataType  EntitySpecifics field number
++ */
++export function defaultSpecifics(dataType) {
++  const writer = new Writer();
++  writer.message(dataType, Buffer.alloc(0));
++  return writer.finish();
++}
+diff --git a/tools/afree-login-service/src/schema.sql b/tools/afree-login-service/src/schema.sql
+index a1173367c5..41872a0311 100644
+--- a/tools/afree-login-service/src/schema.sql
++++ b/tools/afree-login-service/src/schema.sql
+@@ -112,3 +112,47 @@ CREATE TABLE IF NOT EXISTS audit_log (
+ ) STRICT;
+ 
+ CREATE INDEX IF NOT EXISTS audit_log_by_time ON audit_log(created_at);
++
++-- ---------------------------------------------------------------- Chrome Sync
++--
++-- One row per account that has used the sync endpoint. `next_version` is a
++-- per-account monotonic counter shared by all datatypes; clients compare
++-- entity versions against the progress tokens issued by GetUpdates.
++CREATE TABLE IF NOT EXISTS sync_stores (
++  user_id        TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
++  store_birthday TEXT NOT NULL,
++  next_version   INTEGER NOT NULL DEFAULT 0,
++  -- 16 random bytes returned in GetUpdatesResponse.encryption_keys.
++  keystore_key   BLOB,
++  created_at     INTEGER NOT NULL
++) STRICT;
++
++-- Sync entities. `specifics` is the opaque EntitySpecifics payload, so the
++-- same table stores bookmarks, preferences, nigori, ... without the server
++-- having to understand each datatype.
++CREATE TABLE IF NOT EXISTS sync_entities (
++  user_id                   TEXT NOT NULL,
++  id                        TEXT NOT NULL,
++  -- EntitySpecifics field number (BOOKMARKS = 32904, NIGORI = 47745, ...).
++  data_type                 INTEGER NOT NULL,
++  parent_id                 TEXT NOT NULL DEFAULT '0',
++  name                      TEXT NOT NULL DEFAULT '',
++  version                   INTEGER NOT NULL,
++  ctime                     INTEGER NOT NULL DEFAULT 0,
++  mtime                     INTEGER NOT NULL DEFAULT 0,
++  deleted                   INTEGER NOT NULL DEFAULT 0,
++  folder                    INTEGER NOT NULL DEFAULT 0,
++  specifics                 BLOB,
++  client_tag_hash           TEXT NOT NULL DEFAULT '',
++  unique_position           BLOB,
++  originator_cache_guid     TEXT NOT NULL DEFAULT '',
++  originator_client_item_id TEXT NOT NULL DEFAULT '',
++  -- Non-empty only for server-created permanent entities (roots and the
++  -- bookmark folders), which clients match by this tag.
++  server_tag                TEXT NOT NULL DEFAULT '',
++  PRIMARY KEY (user_id, id)
++) STRICT;
++
++CREATE INDEX IF NOT EXISTS sync_entities_by_type
++  ON sync_entities(user_id, data_type, version);
++
+diff --git a/tools/afree-login-service/src/server.mjs b/tools/afree-login-service/src/server.mjs
+index 2dc6c0e589..040cec75c5 100644
+--- a/tools/afree-login-service/src/server.mjs
++++ b/tools/afree-login-service/src/server.mjs
+@@ -4,10 +4,13 @@
+ // found in the LICENSE file.
+ 
+ import http from 'node:http';
++import https from 'node:https';
++import {readFileSync} from 'node:fs';
+ import {pathToFileURL} from 'node:url';
+ import {createLogger, isLoopbackHost, loadConfig, USAGE} from './config.mjs';
+ import {Store} from './db.mjs';
+ import {createGaiaService} from './gaia.mjs';
++import {createSyncService} from './sync.mjs';
+ 
+ /**
+  * Builds the HTTP server without starting it. Used by tests and by the CLI.
+@@ -18,7 +21,12 @@ import {createGaiaService} from './gaia.mjs';
+  */
+ export function createHttpServer({store, config, logger}) {
+   const {handle, service} = createGaiaService({store, config, logger});
+-  const server = http.createServer((req, res) => {
++  const sync = createSyncService({store, config, logger});
++  const handler = (req, res) => {
++    if (sync.handles(req)) {
++      void sync.handle(req, res);
++      return;
++    }
+     handle(req, res).catch((error) => {
+       logger.error('unhandled request error', {
+         error: String(error?.stack ?? error),
+@@ -28,8 +36,17 @@ export function createHttpServer({store, config, logger}) {
+       }
+       res.end('internal error');
+     });
+-  });
+-  return {server, service};
++  };
++  const server = config.tlsCertPath && config.tlsKeyPath ?
++      https.createServer(
++          {
++            cert: readFileSync(config.tlsCertPath),
++            key: readFileSync(config.tlsKeyPath),
++          },
++          handler,
++          ) :
++      http.createServer(handler);
++  return {server, service, sync};
+ }
+ 
+ export async function startServer(config, logger) {
+@@ -54,6 +71,15 @@ async function main() {
+   const config = loadConfig(argv);
+   const logger = createLogger(config.logLevel);
+ 
++  if (Boolean(config.tlsCertPath) !== Boolean(config.tlsKeyPath)) {
++    throw new Error('--tls-cert and --tls-key must be provided together');
++  }
++  if (config.tlsCertPath && !config.secureCookies) {
++    logger.warn(
++        'TLS is enabled but --public-url is not https; cookies will not be ' +
++        'marked Secure. Pass --public-url https://<host>[:port].');
++  }
++
+   if (!config.secureCookies) {
+     const loopback =
+         isLoopbackHost(new URL(config.publicUrl).hostname);
+diff --git a/tools/afree-login-service/src/sync-store.mjs b/tools/afree-login-service/src/sync-store.mjs
+new file mode 100644
+index 0000000000..b22847ac4d
+--- /dev/null
++++ b/tools/afree-login-service/src/sync-store.mjs
+@@ -0,0 +1,306 @@
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {randomBytes} from 'node:crypto';
++import {defaultSpecifics} from './pb.mjs';
++
++export const BOOKMARKS_TYPE = 32904;
++export const NIGORI_TYPE = 47745;
++
++// Root tags follow syncer::DataTypeToProtocolRootTag() in
++// components/sync/base/data_type.cc: "google_chrome_" + stable lowercase name.
++const BOOKMARKS_ROOT_TAG = 'google_chrome_bookmarks';
++const NIGORI_ROOT_TAG = 'google_chrome_nigori';
++
++/**
++ * Permanent entities that Chromium expects to exist in every sync store.
++ * Mirrors CreateDefaultPermanentItems() and CreatePermanentBookmarkFolder()
++ * in components/sync/engine/loopback_server/loopback_server.cc.
++ *
++ * @type {{id: string, dataType: number, parentId: string, name: string,
++ *         folder: boolean, serverTag: string}[]}
++ */
++const PERMANENT_ENTITIES = [
++  {
++    id: `${BOOKMARKS_TYPE}_${BOOKMARKS_ROOT_TAG}`,
++    dataType: BOOKMARKS_TYPE,
++    parentId: '0',
++    name: 'Bookmarks',
++    folder: true,
++    serverTag: BOOKMARKS_ROOT_TAG,
++  },
++  {
++    id: `${BOOKMARKS_TYPE}_bookmark_bar`,
++    dataType: BOOKMARKS_TYPE,
++    parentId: `${BOOKMARKS_TYPE}_${BOOKMARKS_ROOT_TAG}`,
++    name: 'Bookmark Bar',
++    folder: true,
++    serverTag: 'bookmark_bar',
++  },
++  {
++    id: `${BOOKMARKS_TYPE}_other_bookmarks`,
++    dataType: BOOKMARKS_TYPE,
++    parentId: `${BOOKMARKS_TYPE}_${BOOKMARKS_ROOT_TAG}`,
++    name: 'Other Bookmarks',
++    folder: true,
++    serverTag: 'other_bookmarks',
++  },
++  {
++    id: `${BOOKMARKS_TYPE}_synced_bookmarks`,
++    dataType: BOOKMARKS_TYPE,
++    parentId: `${BOOKMARKS_TYPE}_${BOOKMARKS_ROOT_TAG}`,
++    name: 'Synced Bookmarks',
++    folder: true,
++    serverTag: 'synced_bookmarks',
++  },
++  {
++    id: `${NIGORI_TYPE}_${NIGORI_ROOT_TAG}`,
++    dataType: NIGORI_TYPE,
++    parentId: '0',
++    name: 'Encryption Keys',
++    folder: true,
++    serverTag: NIGORI_ROOT_TAG,
++  },
++];
++
++/**
++ * Sync storage on top of the shared SQLite database.
++ */
++export class SyncStore {
++  /** @param {import('./db.mjs').Store} store */
++  constructor(store) {
++    this.db = store.db;
++  }
++
++  /** @param {string} userId */
++  get(userId) {
++    return this.db
++               .prepare('SELECT * FROM sync_stores WHERE user_id = ?')
++               .get(userId) ??
++        null;
++  }
++
++  /**
++   * Creates the store (birthday, keystore key, permanent entities) on first
++   * use. Idempotent.
++   * @param {string} userId
++   */
++  ensure(userId) {
++    const existing = this.get(userId);
++    if (existing) {
++      return existing;
++    }
++    this.db.exec('BEGIN IMMEDIATE');
++    try {
++      // Another process could have created it between the SELECT and BEGIN.
++      const second = this.get(userId);
++      if (second) {
++        this.db.exec('COMMIT');
++        return second;
++      }
++      const now = Math.floor(Date.now() / 1000);
++      this.db
++          .prepare(
++              'INSERT INTO sync_stores(' +
++              'user_id, store_birthday, next_version, keystore_key, created_at' +
++              ') VALUES(?, ?, 0, ?, ?)')
++          .run(
++              userId,
++              randomBytes(16).toString('hex'),
++              randomBytes(16),
++              now,
++          );
++      for (const permanent of PERMANENT_ENTITIES) {
++        this.savePermanent(userId, permanent, now * 1000);
++      }
++      this.db.exec('COMMIT');
++    } catch (error) {
++      this.db.exec('ROLLBACK');
++      throw error;
++    }
++    return this.get(userId);
++  }
++
++  /**
++   * @param {string} userId
++   * @param {(typeof PERMANENT_ENTITIES)[number]} permanent
++   * @param {number} nowMs
++   */
++  savePermanent(userId, permanent, nowMs) {
++    this.save({
++      userId,
++      id: permanent.id,
++      dataType: permanent.dataType,
++      parentId: permanent.parentId,
++      name: permanent.name,
++      ctime: nowMs,
++      mtime: nowMs,
++      deleted: false,
++      folder: permanent.folder,
++      specifics: defaultSpecifics(permanent.dataType),
++      clientTagHash: '',
++      uniquePosition: null,
++      originatorCacheGuid: '',
++      originatorClientItemId: '',
++      serverTag: permanent.serverTag,
++    });
++  }
++
++  /**
++   * Allocates the next version for an account. Node's sqlite bindings are
++   * synchronous and the server is single-threaded, so the read after the
++   * update cannot race with another writer in this process.
++   * @param {string} userId
++   */
++  allocateVersion(userId) {
++    this.db
++        .prepare(
++            'UPDATE sync_stores SET next_version = next_version + 1 ' +
++            'WHERE user_id = ?')
++        .run(userId);
++    const row = this.db
++                    .prepare('SELECT next_version FROM sync_stores WHERE user_id = ?')
++                    .get(userId);
++    return row.next_version;
++  }
++
++  /**
++   * Inserts or updates an entity with a freshly allocated version.
++   * @param {object} entity
++   * @param {string} entity.userId
++   * @param {string} entity.id
++   * @param {number} entity.dataType
++   * @param {string} entity.parentId
++   * @param {string} entity.name
++   * @param {number} entity.ctime
++   * @param {number} entity.mtime
++   * @param {boolean} entity.deleted
++   * @param {boolean} entity.folder
++   * @param {Buffer} entity.specifics
++   * @param {string} entity.clientTagHash
++   * @param {Buffer|null} entity.uniquePosition
++   * @param {string} entity.originatorCacheGuid
++   * @param {string} entity.originatorClientItemId
++   * @param {string} entity.serverTag
++   * @returns {number} the new version
++   */
++  save(entity) {
++    const version = this.allocateVersion(entity.userId);
++    this.db
++        .prepare(
++            'INSERT INTO sync_entities(' +
++            'user_id, id, data_type, parent_id, name, version, ctime, mtime,' +
++            ' deleted, folder, specifics, client_tag_hash, unique_position,' +
++            ' originator_cache_guid, originator_client_item_id, server_tag' +
++            ') VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ' +
++            'ON CONFLICT(user_id, id) DO UPDATE SET ' +
++            'data_type = excluded.data_type, parent_id = excluded.parent_id,' +
++            ' name = excluded.name, version = excluded.version,' +
++            ' ctime = excluded.ctime, mtime = excluded.mtime,' +
++            ' deleted = excluded.deleted, folder = excluded.folder,' +
++            ' specifics = excluded.specifics,' +
++            ' client_tag_hash = excluded.client_tag_hash,' +
++            ' unique_position = excluded.unique_position,' +
++            ' originator_cache_guid = excluded.originator_cache_guid,' +
++            ' originator_client_item_id = excluded.originator_client_item_id,' +
++            ' server_tag = excluded.server_tag')
++        .run(
++            entity.userId,
++            entity.id,
++            entity.dataType,
++            entity.parentId ?? '',
++            entity.name ?? '',
++            version,
++            entity.ctime ?? 0,
++            entity.mtime ?? 0,
++            entity.deleted ? 1 : 0,
++            entity.folder ? 1 : 0,
++            entity.specifics ?? Buffer.alloc(0),
++            entity.clientTagHash ?? '',
++            entity.uniquePosition ?? null,
++            entity.originatorCacheGuid ?? '',
++            entity.originatorClientItemId ?? '',
++            entity.serverTag ?? '',
++        );
++    return version;
++  }
++
++  /** @param {string} userId @param {string} id */
++  entity(userId, id) {
++    return this.db
++               .prepare(
++                   'SELECT * FROM sync_entities WHERE user_id = ? AND id = ?')
++               .get(userId, id) ??
++        null;
++  }
++
++  /**
++   * Returns entities of one datatype newer than `sinceVersion`, oldest first.
++   * @param {string} userId
++   * @param {number} dataType
++   * @param {number} sinceVersion
++   * @param {number} limit
++   * @param {boolean} includeDeleted
++   */
++  list(userId, dataType, sinceVersion, limit, includeDeleted) {
++    return this.db
++        .prepare(
++            'SELECT * FROM sync_entities WHERE user_id = ? AND data_type = ?' +
++            ' AND version > ? AND (? = 1 OR deleted = 0)' +
++            ' ORDER BY version ASC LIMIT ?')
++        .all(userId, dataType, sinceVersion, includeDeleted ? 1 : 0, limit);
++  }
++
++  /**
++   * @param {string} userId
++   * @param {number} dataType
++   * @param {number} sinceVersion
++   * @param {boolean} includeDeleted
++   */
++  countAfter(userId, dataType, sinceVersion, includeDeleted) {
++    const row = this.db
++                    .prepare(
++                        'SELECT COUNT(*) AS count FROM sync_entities ' +
++                        'WHERE user_id = ? AND data_type = ? AND version > ?' +
++                        ' AND (? = 1 OR deleted = 0)')
++                    .get(userId, dataType, sinceVersion, includeDeleted ? 1 : 0);
++    return row.count;
++  }
++
++  /**
++   * Handles ClearServerData: drop all entities, rotate the birthday and
++   * recreate the permanent entities.
++   * @param {string} userId
++   */
++  clear(userId) {
++    this.db.exec('BEGIN IMMEDIATE');
++    try {
++      this.db
++          .prepare('DELETE FROM sync_entities WHERE user_id = ?')
++          .run(userId);
++      this.db
++          .prepare(
++              'UPDATE sync_stores SET store_birthday = ?, next_version = 0 ' +
++              'WHERE user_id = ?')
++          .run(randomBytes(16).toString('hex'), userId);
++      this.db.exec('COMMIT');
++    } catch (error) {
++      this.db.exec('ROLLBACK');
++      throw error;
++    }
++    // Recreate the permanent entities with fresh versions. The row already
++    // exists, so ensure() would return early; do it explicitly.
++    this.db.exec('BEGIN IMMEDIATE');
++    try {
++      const now = Date.now();
++      for (const permanent of PERMANENT_ENTITIES) {
++        this.savePermanent(userId, permanent, now);
++      }
++      this.db.exec('COMMIT');
++    } catch (error) {
++      this.db.exec('ROLLBACK');
++      throw error;
++    }
++  }
++}
+diff --git a/tools/afree-login-service/src/sync.mjs b/tools/afree-login-service/src/sync.mjs
+new file mode 100644
+index 0000000000..870852217c
+--- /dev/null
++++ b/tools/afree-login-service/src/sync.mjs
+@@ -0,0 +1,655 @@
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Minimal Chrome Sync server (`/command/`).
++//
++// Chromium posts a gzip-compressed `sync_pb::ClientToServerMessage` to
++// `<sync-url>/command/` and expects a `sync_pb::ClientToServerResponse`:
++//
++//   components/sync/engine/net/http_bridge.cc        request/response transport
++//   components/sync/engine/net/sync_server_connection_manager.cc
++//   components/sync/engine/sync_manager_impl.cc      "/command/" path
++//   components/sync/protocol/sync.proto              message shapes
++//   components/sync/protocol/sync_entity.proto       SyncEntity
++//   components/sync/engine/loopback_server/          reference implementation
++//
++// The implementation below is datatype-agnostic: `EntitySpecifics` payloads are
++// stored as opaque blobs and echoed back. That is enough for bookmarks (and in
++// practice for preferences/theme/extensions as well) because Chromium never
++// asks the server to interpret the payload - it only relies on the ids,
++// versions, parent hierarchy, `folder`/`deleted` flags and progress tokens.
++//
++// Datatypes are keyed by their `EntitySpecifics` field number:
++//   BOOKMARKS = 32904    (components/sync/protocol/entity_specifics.proto)
++//   NIGORI    = 47745
++
++import {randomUUID} from 'node:crypto';
++import {gunzipSync, inflateSync} from 'node:zlib';
++import {
++  WIRE_LENGTH,
++  Writer,
++  defaultSpecifics,
++  entitySpecificsType,
++  fieldValues,
++  firstBool,
++  firstField,
++  firstNumber,
++  firstString,
++  readFields,
++} from './pb.mjs';
++import {BOOKMARKS_TYPE, NIGORI_TYPE, SyncStore} from './sync-store.mjs';
++
++const MAX_BODY_BYTES = 64 * 1024 * 1024;
++const MAX_GET_UPDATES_BATCH = 500;
++
++// sync_pb::CommitResponse::ResponseType
++const COMMIT_SUCCESS = 1;
++const COMMIT_INVALID_MESSAGE = 4;
++
++// sync_pb::SyncEnums::ErrorType
++const ERROR_SUCCESS = 0;
++const ERROR_NOT_MY_BIRTHDAY = 2;
++const ERROR_UNKNOWN = 100;
++
++// sync_pb::NigoriSpecifics::PassphraseType
++const KEYSTORE_PASSPHRASE = 2;
++const NIGORI_PASSPHRASE_TYPE_FIELD = 30;
++
++// ClientToServerMessage::Contents
++const CONTENTS_COMMIT = 1;
++const CONTENTS_GET_UPDATES = 2;
++const CONTENTS_CLEAR_SERVER_DATA = 5;
++
++/** @param {unknown} value */
++function toBuffer(value) {
++  if (!value) {
++    return null;
++  }
++  return Buffer.isBuffer(value) ? value : Buffer.from(/** @type {any} */ (value));
++}
++
++function pathnameOf(req) {
++  try {
++    return new URL(req.url ?? '/', 'http://localhost').pathname;
++  } catch {
++    return '';
++  }
++}
++
++/** @param {import('node:http').IncomingMessage} req */
++function bearerToken(req) {
++  const header = String(req.headers.authorization ?? '');
++  const match = /^Bearer\s+(.+)$/i.exec(header);
++  return match ? match[1].trim() : null;
++}
++
++/**
++ * Progress tokens are opaque to the client. This server uses the decimal
++ * version of the newest entity it has sent; loopback-style "<migration>/<v>"
++ * tokens are accepted too.
++ * @param {string} token
++ */
++function parseProgressToken(token) {
++  if (!token) {
++    return 0;
++  }
++  const tail = String(token).split('/').pop() ?? '0';
++  const value = Number(tail);
++  return Number.isFinite(value) && value >= 0 ? Math.trunc(value) : 0;
++}
++
++/**
++ * @param {Uint8Array|Buffer|null} specifics
++ * @returns {number} passphrase type from NigoriSpecifics
++ */
++function nigoriPassphraseType(specifics) {
++  const buffer = toBuffer(specifics);
++  if (!buffer || buffer.length === 0) {
++    return 1;
++  }
++  try {
++    const outer = readFields(buffer);
++    const nigori = firstField(outer, NIGORI_TYPE, WIRE_LENGTH);
++    if (!nigori) {
++      return 1;
++    }
++    return firstNumber(readFields(toBuffer(nigori)), NIGORI_PASSPHRASE_TYPE_FIELD) ??
++        1;
++  } catch {
++    return 1;
++  }
++}
++
++/**
++ * @param {import('node:http').IncomingMessage} req
++ */
++async function readRequestBody(req) {
++  /** @type {Buffer[]} */
++  const chunks = [];
++  let total = 0;
++  for await (const chunk of req) {
++    total += chunk.length;
++    if (total > MAX_BODY_BYTES) {
++      const error = new Error('sync request too large');
++      // @ts-ignore
++      error.statusCode = 413;
++      throw error;
++    }
++    chunks.push(chunk);
++  }
++  let body = Buffer.concat(chunks);
++  const encoding = String(req.headers['content-encoding'] ?? '').toLowerCase();
++  if (encoding.includes('gzip')) {
++    body = gunzipSync(body);
++  } else if (encoding.includes('deflate')) {
++    body = inflateSync(body);
++  }
++  return body;
++}
++
++export class SyncService {
++  /**
++   * @param {object} options
++   * @param {import('./db.mjs').Store} options.store
++   * @param {import('./config.mjs').Config} options.config
++   * @param {ReturnType<import('./config.mjs').createLogger>} options.logger
++   */
++  constructor({store, config, logger}) {
++    this.store = store;
++    this.config = config;
++    this.logger = logger;
++    this.syncStore = new SyncStore(store);
++  }
++
++  /** @param {import('node:http').IncomingMessage} req */
++  handles(req) {
++    const path = pathnameOf(req);
++    // Accept any prefix so both `--sync-url=http://host:8080` (which becomes
++    // /command/) and Chromium's default dev URL (<host>/chrome-sync/dev/command/)
++    // work without extra configuration.
++    return /(^|\/)command\/?$/.test(path) || /(^|\/)event\/?$/.test(path);
++  }
++
++  /**
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   */
++  async handle(req, res) {
++    const path = pathnameOf(req);
++    try {
++      if (req.method !== 'POST') {
++        res.writeHead(405, {'Allow': 'POST'});
++        res.end();
++        return;
++      }
++
++      const body = await readRequestBody(req);
++
++      // /event is only used by SyncStoppedReporter; the response is empty.
++      if (path.endsWith('/event') || path.endsWith('/event/')) {
++        res.writeHead(200, {
++          'Content-Type': 'application/octet-stream',
++          'Cache-Control': 'no-store',
++        });
++        res.end();
++        return;
++      }
++
++      const token = bearerToken(req);
++      const access = token ? this.store.getAccessToken(token) : null;
++      const user = access ? this.store.getUserById(access.user_id) : null;
++      if (!user || user.disabled) {
++        res.writeHead(401, {
++          'WWW-Authenticate': 'Bearer',
++          'Content-Type': 'text/plain; charset=utf-8',
++        });
++        res.end('unauthorized');
++        return;
++      }
++
++      let requestFields;
++      try {
++        requestFields = readFields(body);
++      } catch (error) {
++        this.logger.warn('sync: malformed request', {
++          error: String(error?.message ?? error),
++        });
++        res.writeHead(400, {'Content-Type': 'text/plain; charset=utf-8'});
++        res.end('malformed sync request');
++        return;
++      }
++
++      const response = this.dispatch(user, requestFields);
++      res.writeHead(200, {
++        'Content-Type': 'application/octet-stream',
++        'Cache-Control': 'no-store',
++        'Content-Length': response.length,
++      });
++      res.end(response);
++    } catch (error) {
++      const status = /** @type {any} */ (error)?.statusCode ?? 500;
++      this.logger.error('sync request failed', {
++        path,
++        error: String(/** @type {any} */ (error)?.stack ?? error),
++      });
++      if (!res.headersSent) {
++        res.writeHead(status, {'Content-Type': 'text/plain; charset=utf-8'});
++      }
++      res.end(status === 413 ? 'payload too large' : 'internal error');
++    }
++  }
++
++  /**
++   * @param {any} user
++   * @param {import('./pb.mjs').Field[]} fields
++   * @returns {Buffer}
++   */
++  dispatch(user, fields) {
++    const contents = firstNumber(fields, 3) ?? 0;
++    const clientBirthday = firstString(fields, 7) ?? '';
++    let sync = this.syncStore.ensure(user.id);
++
++    const response = new Writer();
++    let errorCode = ERROR_SUCCESS;
++    let errorMessage = '';
++
++    if (clientBirthday && clientBirthday !== sync.store_birthday) {
++      // Chromium treats this as "clear local sync metadata and start over".
++      errorCode = ERROR_NOT_MY_BIRTHDAY;
++      errorMessage = 'store birthday mismatch';
++    } else if (contents === CONTENTS_GET_UPDATES) {
++      const message = firstField(fields, 5, WIRE_LENGTH);
++      if (!message) {
++        errorCode = ERROR_UNKNOWN;
++        errorMessage = 'missing get_updates';
++      } else {
++        response.message(
++            2, this.handleGetUpdates(user.id, toBuffer(message), sync));
++      }
++    } else if (contents === CONTENTS_COMMIT) {
++      const message = firstField(fields, 4, WIRE_LENGTH);
++      if (!message) {
++        errorCode = ERROR_UNKNOWN;
++        errorMessage = 'missing commit';
++      } else {
++        response.message(1, this.handleCommit(user.id, toBuffer(message)));
++      }
++    } else if (contents === CONTENTS_CLEAR_SERVER_DATA) {
++      this.syncStore.clear(user.id);
++      sync = this.syncStore.get(user.id);
++      this.logger.info('sync: cleared server data', { userId: user.id });
++    } else {
++      errorCode = ERROR_UNKNOWN;
++      errorMessage = `unsupported message_contents ${contents}`;
++    }
++
++    response.varint(4, errorCode);
++    if (errorMessage) {
++      response.string(5, errorMessage);
++    }
++    response.string(6, sync.store_birthday);
++    return response.finish();
++  }
++
++  /**
++   * @param {string} userId
++   * @param {Buffer} message
++   * @param {any} sync
++   */
++  handleGetUpdates(userId, message, sync) {
++    const fields = readFields(message);
++    /** @type {{dataType: number, token: string}[]} */
++    const markers = fieldValues(fields, 6, WIRE_LENGTH).map((raw) => {
++      const marker = readFields(toBuffer(raw));
++      return {
++        dataType: firstNumber(marker, 1) ?? 0,
++        token: firstString(marker, 2) ?? '',
++      };
++    });
++    const needEncryptionKey = firstBool(fields, 8) === true;
++
++    const response = new Writer();
++    let changesRemaining = 0;
++    /** @type {Buffer[]} */
++    const newMarkers = [];
++    let includeKeystoreKey = needEncryptionKey;
++
++    for (const marker of markers) {
++      if (marker.dataType === NIGORI_TYPE) {
++        const nigori = this.syncStore.entity(
++            userId, `${NIGORI_TYPE}_google_chrome_nigori`);
++        if (nigori &&
++            nigoriPassphraseType(nigori.specifics) === KEYSTORE_PASSPHRASE) {
++          includeKeystoreKey = true;
++        }
++      }
++
++      const since = parseProgressToken(marker.token);
++      const includeDeleted = since > 0;
++      const rows = this.syncStore.list(
++          userId, marker.dataType, since, MAX_GET_UPDATES_BATCH,
++          includeDeleted);
++      for (const row of rows) {
++        response.message(1, this.encodeEntity(row));
++      }
++
++      const token = rows.length > 0 ?
++          String(rows[rows.length - 1].version) :
++          (marker.token || '0');
++      const remaining = this.syncStore.countAfter(
++                            userId, marker.dataType, since, includeDeleted) -
++          rows.length;
++      if (remaining > 0) {
++        changesRemaining += remaining;
++      }
++
++      const newMarker = new Writer();
++      newMarker.varint(1, marker.dataType);
++      newMarker.string(2, token);
++      newMarkers.push(newMarker.finish());
++    }
++
++    for (const marker of newMarkers) {
++      response.message(5, marker);
++    }
++    response.varint(4, changesRemaining);
++    if (includeKeystoreKey && sync.keystore_key) {
++      response.bytes(6, toBuffer(sync.keystore_key));
++    }
++
++    this.logger.debug('sync: get updates', {
++      userId,
++      types: markers.map((marker) => marker.dataType),
++      changesRemaining,
++    });
++    return response.finish();
++  }
++
++  /**
++   * @param {string} userId
++   * @param {Buffer} message
++   */
++  handleCommit(userId, message) {
++    const fields = readFields(message);
++    const cacheGuid = firstString(fields, 2) ?? '';
++    const entries = fieldValues(fields, 1, WIRE_LENGTH);
++
++    const response = new Writer();
++    /** @type {Map<string, string>} */
++    const renamedIds = new Map();
++    let committed = 0;
++
++    for (const rawEntry of entries) {
++      const entity = this.decodeEntity(toBuffer(rawEntry));
++      const result =
++          this.commitEntity(userId, entity, cacheGuid, renamedIds);
++      response.group(1, (group) => {
++        group.varint(2, result.responseType);
++        if (result.id) {
++          group.string(3, result.id);
++        }
++        if (result.version) {
++          group.varint(6, result.version);
++        }
++        if (result.error) {
++          group.string(9, result.error);
++        }
++      });
++      if (result.responseType === COMMIT_SUCCESS) {
++        committed += 1;
++      }
++      if (result.clientId && result.id && result.clientId !== result.id) {
++        renamedIds.set(result.clientId, result.id);
++      }
++    }
++
++    this.logger.debug('sync: commit', {userId, entries: entries.length, committed});
++    return response.finish();
++  }
++
++  /**
++   * @param {string} userId
++   * @param {object} entity
++   * @param {string} cacheGuid
++   * @param {Map<string, string>} renamedIds
++   */
++  commitEntity(userId, entity, cacheGuid, renamedIds) {
++    const existing = entity.id ? this.syncStore.entity(userId, entity.id) : null;
++
++    let dataType = entitySpecificsType(entity.specifics);
++    if (dataType === 1) {
++      // EntitySpecifics.encrypted: the datatype is not readable. Fall back to
++      // the type prefix of the id/parent, which bookmarks always carry.
++      dataType = 0;
++    }
++    if (!dataType) {
++      dataType = this.typeFromId(entity.id) || this.typeFromId(entity.parentId);
++    }
++    if (existing) {
++      dataType = existing.data_type;
++    }
++
++    if (!dataType) {
++      return {
++        responseType: COMMIT_INVALID_MESSAGE,
++        id: entity.id,
++        version: 0,
++        error: 'cannot determine datatype',
++        clientId: entity.id,
++      };
++    }
++
++    let id = entity.id;
++    if (!existing) {
++      if (dataType === BOOKMARKS_TYPE && entity.id) {
++        id = entity.id.startsWith(`${BOOKMARKS_TYPE}_`) ?
++            entity.id :
++            `${BOOKMARKS_TYPE}_${entity.id}`;
++      } else if (entity.clientTagHash && entity.version === 0) {
++        id = `${dataType}_${entity.clientTagHash}`;
++      } else if (entity.id) {
++        id = entity.id.startsWith(`${dataType}_`) ?
++            entity.id :
++            `${dataType}_${entity.id}`;
++      } else {
++        id = `${dataType}_${randomUUID()}`;
++      }
++    }
++
++    let parentId = renamedIds.get(entity.parentId) ?? entity.parentId;
++    if (!parentId) {
++      parentId = existing ? existing.parent_id : '';
++    }
++    if (!parentId && dataType === BOOKMARKS_TYPE) {
++      // Every bookmark must live under a folder; default to "Other bookmarks"
++      // rather than dropping it.
++      parentId = `${BOOKMARKS_TYPE}_other_bookmarks`;
++    }
++
++    const now = Date.now();
++
++    if (entity.deleted) {
++      if (!existing && entity.version === 0) {
++        // Deleting something that was never uploaded: nothing to do.
++        return {
++          responseType: COMMIT_SUCCESS,
++          id,
++          version: 0,
++          clientId: entity.id,
++        };
++      }
++      const version = this.syncStore.save({
++        userId,
++        id,
++        dataType,
++        parentId: existing ? existing.parent_id : parentId,
++        name: '',
++        ctime: existing ? existing.ctime : 0,
++        mtime: now,
++        deleted: true,
++        folder: existing ? existing.folder === 1 : false,
++        specifics: existing ?
++            toBuffer(existing.specifics) :
++            defaultSpecifics(dataType),
++        clientTagHash: existing ? existing.client_tag_hash : '',
++        uniquePosition: existing ? toBuffer(existing.unique_position) : null,
++        originatorCacheGuid: existing ? existing.originator_cache_guid : '',
++        originatorClientItemId:
++            existing ? existing.originator_client_item_id : '',
++        serverTag: existing ? existing.server_tag : '',
++      });
++      if (existing && existing.folder === 1) {
++        this.deleteDescendants(userId, id, now);
++      }
++      return {
++        responseType: COMMIT_SUCCESS,
++        id,
++        version,
++        clientId: entity.id,
++      };
++    }
++
++    const specifics = entity.specifics && entity.specifics.length > 0 ?
++        entity.specifics :
++        (existing && existing.specifics ?
++             toBuffer(existing.specifics) :
++             defaultSpecifics(dataType));
++
++    const version = this.syncStore.save({
++      userId,
++      id,
++      dataType,
++      parentId,
++      name: entity.name || (existing ? existing.name : ''),
++      ctime: entity.ctime || (existing ? existing.ctime : now),
++      mtime: entity.mtime || now,
++      deleted: false,
++      folder: entity.folder || (existing ? existing.folder === 1 : false),
++      specifics,
++      clientTagHash:
++          entity.clientTagHash || (existing ? existing.client_tag_hash : ''),
++      uniquePosition: entity.uniquePosition ??
++          (existing ? toBuffer(existing.unique_position) : null),
++      originatorCacheGuid: existing ? existing.originator_cache_guid :
++                                     (entity.version === 0 ? cacheGuid : ''),
++      originatorClientItemId: existing ? existing.originator_client_item_id :
++                                        (entity.version === 0 ? entity.id : ''),
++      serverTag: existing ? existing.server_tag : '',
++    });
++
++    return {
++      responseType: COMMIT_SUCCESS,
++      id,
++      version,
++      clientId: entity.id,
++    };
++  }
++
++  /**
++   * Marks every non-deleted descendant of a deleted folder as deleted.
++   * @param {string} userId
++   * @param {string} parentId
++   * @param {number} now
++   */
++  deleteDescendants(userId, parentId, now) {
++    const children = this.syncStore.db
++                         .prepare(
++                             'SELECT * FROM sync_entities WHERE user_id = ? ' +
++                             'AND parent_id = ? AND deleted = 0')
++                         .all(userId, parentId);
++    for (const child of children) {
++      this.syncStore.save({
++        userId,
++        id: child.id,
++        dataType: child.data_type,
++        parentId: child.parent_id,
++        name: '',
++        ctime: child.ctime,
++        mtime: now,
++        deleted: true,
++        folder: child.folder === 1,
++        specifics: toBuffer(child.specifics),
++        clientTagHash: child.client_tag_hash,
++        uniquePosition: toBuffer(child.unique_position),
++        originatorCacheGuid: child.originator_cache_guid,
++        originatorClientItemId: child.originator_client_item_id,
++        serverTag: child.server_tag,
++      });
++      this.deleteDescendants(userId, child.id, now);
++    }
++  }
++
++  /** @param {string} id */
++  typeFromId(id) {
++    const match = /^(\d+)_/.exec(String(id ?? ''));
++    return match ? Number(match[1]) : 0;
++  }
++
++  /** @param {Buffer} buffer */
++  decodeEntity(buffer) {
++    const fields = readFields(buffer);
++    return {
++      id: firstString(fields, 1) ?? '',
++      parentId: firstString(fields, 2) ?? '',
++      version: firstNumber(fields, 4) ?? 0,
++      mtime: firstNumber(fields, 5) ?? 0,
++      ctime: firstNumber(fields, 6) ?? 0,
++      name: firstString(fields, 7) ?? firstString(fields, 8) ?? '',
++      deleted: firstBool(fields, 18) ?? false,
++      folder: firstBool(fields, 22) ?? false,
++      specifics: toBuffer(firstField(fields, 21, WIRE_LENGTH)) ??
++          Buffer.alloc(0),
++      clientTagHash: firstString(fields, 23) ?? '',
++      uniquePosition: toBuffer(firstField(fields, 25, WIRE_LENGTH)),
++    };
++  }
++
++  /** @param {any} row */
++  encodeEntity(row) {
++    const specifics = row.deleted === 1 ? defaultSpecifics(row.data_type) :
++        (row.specifics && row.specifics.length > 0 ?
++             toBuffer(row.specifics) :
++             defaultSpecifics(row.data_type));
++    const writer = new Writer();
++    writer.string(1, row.id);
++    if (row.parent_id) {
++      writer.string(2, row.parent_id);
++    }
++    writer.varint(4, row.version);
++    writer.varint(5, row.mtime);
++    writer.varint(6, row.ctime);
++    if (row.name) {
++      writer.string(7, row.name);
++    }
++    if (row.server_tag) {
++      writer.string(10, row.server_tag);
++    }
++    writer.bool(18, row.deleted === 1);
++    if (row.originator_cache_guid) {
++      writer.string(19, row.originator_cache_guid);
++    }
++    if (row.originator_client_item_id) {
++      writer.string(20, row.originator_client_item_id);
++    }
++    writer.message(21, specifics);
++    writer.bool(22, row.folder === 1);
++    if (row.client_tag_hash) {
++      writer.string(23, row.client_tag_hash);
++    }
++    if (row.unique_position) {
++      writer.message(25, toBuffer(row.unique_position));
++    }
++    return writer.finish();
++  }
++}
++
++/**
++ * @param {object} options
++ * @param {import('./db.mjs').Store} options.store
++ * @param {import('./config.mjs').Config} options.config
++ * @param {ReturnType<import('./config.mjs').createLogger>} options.logger
++ */
++export function createSyncService({store, config, logger}) {
++  return new SyncService({store, config, logger});
++}
+diff --git a/tools/afree-login-service/test/sync.test.mjs b/tools/afree-login-service/test/sync.test.mjs
+new file mode 100644
+index 0000000000..a37e104960
+--- /dev/null
++++ b/tools/afree-login-service/test/sync.test.mjs
+@@ -0,0 +1,460 @@
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// End-to-end tests for the minimal Chrome Sync backend. The messages are built
++// with the same protobuf field numbers Chromium uses:
++//   components/sync/protocol/sync.proto
++//   components/sync/protocol/sync_entity.proto
++//   components/sync/protocol/bookmark_specifics.proto
++
++import assert from 'node:assert/strict';
++import {mkdtempSync, rmSync} from 'node:fs';
++import {tmpdir} from 'node:os';
++import path from 'node:path';
++import {gzipSync} from 'node:zlib';
++import {after, before, test} from 'node:test';
++
++import {createLogger} from '../src/config.mjs';
++import {Store} from '../src/db.mjs';
++import {
++  WIRE_LENGTH,
++  WIRE_START_GROUP,
++  Writer,
++  entitySpecificsType,
++  fieldValues,
++  firstBool,
++  firstField,
++  firstNumber,
++  firstString,
++  readFields,
++} from '../src/pb.mjs';
++import {createHttpServer} from '../src/server.mjs';
++
++const EMAIL = 'sync-tester@example.com';
++const PASSWORD = 'sync correct horse battery staple';
++const BOOKMARKS = 32904;
++const NIGORI = 47745;
++
++/** @type {Store} */
++let store;
++/** @type {import('node:http').Server} */
++let server;
++/** @type {string} */
++let base;
++/** @type {string} */
++let tempDir;
++/** @type {string} */
++let accessToken;
++/** @type {string} */
++let userId;
++/** @type {string} */
++let birthday = '';
++
++async function postCommand(body, token = accessToken) {
++  const response = await fetch(`${base}/command/`, {
++    method: 'POST',
++    headers: {
++      'Authorization': `Bearer ${token}`,
++      'Content-Type': 'application/octet-stream',
++      'Content-Encoding': 'gzip',
++    },
++    body: gzipSync(body),
++  });
++  return {
++    status: response.status,
++    body: Buffer.from(await response.arrayBuffer()),
++  };
++}
++
++function buildGetUpdates({markers, needKey = false}) {
++  const getUpdates = new Writer();
++  for (const marker of markers) {
++    const entry = new Writer().varint(1, marker.type);
++    if (marker.token !== undefined) {
++      entry.string(2, marker.token);
++    }
++    getUpdates.message(6, entry.finish());
++  }
++  if (needKey) {
++    getUpdates.bool(8, true);
++  }
++  const message = new Writer();
++  message.string(1, EMAIL);
++  message.varint(3, 2);  // GET_UPDATES
++  message.message(5, getUpdates.finish());
++  if (birthday) {
++    message.string(7, birthday);
++  }
++  return message.finish();
++}
++
++function buildCommit(entries) {
++  const commit = new Writer();
++  for (const entry of entries) {
++    const entity = new Writer();
++    if (entry.id) {
++      entity.string(1, entry.id);
++    }
++    if (entry.parentId) {
++      entity.string(2, entry.parentId);
++    }
++    if (entry.version !== undefined) {
++      entity.varint(4, entry.version);
++    }
++    if (entry.mtime) {
++      entity.varint(5, entry.mtime);
++    }
++    if (entry.ctime) {
++      entity.varint(6, entry.ctime);
++    }
++    if (entry.name) {
++      entity.string(7, entry.name);
++    }
++    if (entry.deleted) {
++      entity.bool(18, true);
++    }
++    if (entry.specifics) {
++      entity.message(21, entry.specifics);
++    }
++    if (entry.folder !== undefined) {
++      entity.bool(22, entry.folder);
++    }
++    if (entry.clientTagHash) {
++      entity.string(23, entry.clientTagHash);
++    }
++    commit.message(1, entity.finish());
++  }
++  commit.string(2, 'test-cache-guid');
++  const message = new Writer();
++  message.string(1, EMAIL);
++  message.varint(3, 1);  // COMMIT
++  message.message(4, commit.finish());
++  if (birthday) {
++    message.string(7, birthday);
++  }
++  return message.finish();
++}
++
++function buildClearServerData() {
++  const message = new Writer();
++  message.string(1, EMAIL);
++  message.varint(3, 5);  // CLEAR_SERVER_DATA
++  if (birthday) {
++    message.string(7, birthday);
++  }
++  return message.finish();
++}
++
++function bookmarkSpecifics({guid, url, title}) {
++  const specifics = new Writer()
++                        .string(1, url)     // BookmarkSpecifics.url
++                        .string(10, guid)   // guid
++                        .string(11, title)  // full_title
++                        .varint(15, 1);     // type = URL
++  return new Writer().message(BOOKMARKS, specifics.finish()).finish();
++}
++
++function parseGetUpdates(buffer) {
++  const fields = readFields(buffer);
++  return {
++    entries: fieldValues(fields, 1, WIRE_LENGTH).map(decodeEntity),
++    markers: fieldValues(fields, 5, WIRE_LENGTH).map((raw) => {
++      const marker = readFields(raw);
++      return {
++        type: firstNumber(marker, 1) ?? 0,
++        token: firstString(marker, 2) ?? '',
++      };
++    }),
++    changesRemaining: firstNumber(fields, 4) ?? 0,
++    encryptionKeys: fieldValues(fields, 6, WIRE_LENGTH),
++  };
++}
++
++function decodeEntity(buffer) {
++  const fields = readFields(buffer);
++  return {
++    id: firstString(fields, 1) ?? '',
++    parentId: firstString(fields, 2) ?? '',
++    version: firstNumber(fields, 4) ?? 0,
++    name: firstString(fields, 7) ?? '',
++    serverTag: firstString(fields, 10) ?? '',
++    deleted: firstBool(fields, 18) ?? false,
++    specifics: Buffer.from(firstField(fields, 21, WIRE_LENGTH) ?? Buffer.alloc(0)),
++    folder: firstBool(fields, 22) ?? false,
++  };
++}
++
++function parseCommitResponse(buffer) {
++  const fields = readFields(buffer);
++  const commit = firstField(fields, 1, WIRE_LENGTH);
++  return fieldValues(readFields(commit), 1, WIRE_START_GROUP).map((group) => {
++    const entry = readFields(group);
++    return {
++      responseType: firstNumber(entry, 2) ?? 0,
++      id: firstString(entry, 3) ?? '',
++      version: firstNumber(entry, 6) ?? 0,
++    };
++  });
++}
++
++function responseHeader(buffer) {
++  const fields = readFields(buffer);
++  return {
++    errorCode: firstNumber(fields, 4) ?? 0,
++    errorMessage: firstString(fields, 5) ?? '',
++    birthday: firstString(fields, 6) ?? '',
++    getUpdates: firstField(fields, 2, WIRE_LENGTH),
++  };
++}
++
++before(async () => {
++  tempDir = mkdtempSync(path.join(tmpdir(), 'afree-sync-test-'));
++  store = Store.open(path.join(tempDir, 'sync.sqlite3'));
++  const user = store.createUser({email: EMAIL, password: PASSWORD});
++  userId = user.id;
++  accessToken = store.createAccessToken({
++    userId: user.id,
++    clientId: 'afree-client-id',
++    scope: 'https://www.googleapis.com/auth/chromesync',
++    ttlSeconds: 3600,
++  });
++
++  /** @type {import('../src/config.mjs').Config} */
++  const config = {
++    host: '127.0.0.1',
++    port: 0,
++    dbPath: path.join(tempDir, 'sync.sqlite3'),
++    publicUrl: 'http://127.0.0.1',
++    cookieHost: '127.0.0.1',
++    secureCookies: false,
++    accessTokenTtlSeconds: 3600,
++    refreshTokenTtlDays: 0,
++    authCodeTtlSeconds: 300,
++    sessionTtlDays: 30,
++    logLevel: 'silent',
++    allowRegistration: false,
++    allowedContinueHosts: [],
++    emitOAuthCodeCookie: true,
++    redirectContinue: false,
++  };
++
++  const {server: created} =
++      createHttpServer({store, config, logger: createLogger('silent')});
++  server = created;
++  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
++  const address = server.address();
++  base = `http://127.0.0.1:${address.port}`;
++  config.port = address.port;
++  config.publicUrl = base;
++});
++
++after(async () => {
++  await new Promise((resolve) => server.close(resolve));
++  store.close();
++  rmSync(tempDir, {recursive: true, force: true});
++});
++
++let bookmarkToken = '';
++let nigoriToken = '';
++
++test('initial GetUpdates returns permanent folders and keystore key', async () => {
++  const response = await postCommand(buildGetUpdates({
++    markers: [{type: BOOKMARKS}, {type: NIGORI}],
++    needKey: true,
++  }));
++  assert.equal(response.status, 200);
++
++  const header = responseHeader(response.body);
++  assert.equal(header.errorCode, 0);
++  assert.ok(header.birthday);
++  birthday = header.birthday;
++
++  const updates = parseGetUpdates(header.getUpdates);
++  const ids = updates.entries.map((entry) => entry.id);
++  for (const expected of [
++    '32904_google_chrome_bookmarks',
++    '32904_bookmark_bar',
++    '32904_other_bookmarks',
++    '32904_synced_bookmarks',
++    '47745_google_chrome_nigori',
++  ]) {
++    assert.ok(ids.includes(expected), `missing ${expected}`);
++  }
++
++  const bookmarkBar =
++      updates.entries.find((entry) => entry.id === '32904_bookmark_bar');
++  assert.equal(bookmarkBar.serverTag, 'bookmark_bar');
++  assert.equal(bookmarkBar.folder, true);
++  assert.equal(entitySpecificsType(bookmarkBar.specifics), BOOKMARKS);
++
++  assert.equal(updates.encryptionKeys.length, 1);
++  assert.equal(updates.encryptionKeys[0].length, 16);
++
++  bookmarkToken = updates.markers.find((m) => m.type === BOOKMARKS).token;
++  nigoriToken = updates.markers.find((m) => m.type === NIGORI).token;
++  assert.ok(bookmarkToken);
++  assert.ok(nigoriToken);
++});
++
++test('incremental GetUpdates with up-to-date tokens sends nothing', async () => {
++  const response = await postCommand(buildGetUpdates({
++    markers: [
++      {type: BOOKMARKS, token: bookmarkToken},
++      {type: NIGORI, token: nigoriToken},
++    ],
++  }));
++  const header = responseHeader(response.body);
++  const updates = parseGetUpdates(header.getUpdates);
++  assert.equal(updates.entries.length, 0);
++  assert.equal(updates.changesRemaining, 0);
++  assert.equal(
++      updates.markers.find((m) => m.type === BOOKMARKS).token, bookmarkToken);
++});
++
++const GUID = '0f7c2d3e-aaaa-4bbb-8ccc-ddddeeeeffff';
++const bookmarkBytes = bookmarkSpecifics({
++  guid: GUID,
++  url: 'https://example.com/',
++  title: 'Example',
++});
++let serverId = '';
++let bookmarkVersion = 0;
++
++test('commit creates a bookmark with a server assigned id', async () => {
++  const response = await postCommand(buildCommit([{
++    id: GUID,
++    parentId: '32904_bookmark_bar',
++    version: 0,
++    name: 'Example',
++    specifics: bookmarkBytes,
++    folder: false,
++    clientTagHash: 'client-tag-hash',
++  }]));
++  assert.equal(response.status, 200);
++  const header = responseHeader(response.body);
++  assert.equal(header.errorCode, 0);
++
++  const results = parseCommitResponse(response.body);
++  assert.equal(results.length, 1);
++  assert.equal(results[0].responseType, 1);  // SUCCESS
++  assert.equal(results[0].id, `32904_${GUID}`);
++  assert.ok(results[0].version > 0);
++
++  serverId = results[0].id;
++  bookmarkVersion = results[0].version;
++});
++
++test('a second client downloads the committed bookmark', async () => {
++  const response = await postCommand(buildGetUpdates({
++    markers: [
++      {type: BOOKMARKS, token: bookmarkToken},
++      {type: NIGORI, token: nigoriToken},
++    ],
++  }));
++  const updates =
++      parseGetUpdates(responseHeader(response.body).getUpdates);
++  const entry = updates.entries.find((item) => item.id === serverId);
++  assert.ok(entry, 'committed bookmark not returned');
++  assert.equal(entry.parentId, '32904_bookmark_bar');
++  assert.equal(entry.name, 'Example');
++  assert.equal(entry.folder, false);
++  assert.deepEqual(entry.specifics, bookmarkBytes);
++  assert.equal(entitySpecificsType(entry.specifics), BOOKMARKS);
++
++  const newToken = updates.markers.find((m) => m.type === BOOKMARKS).token;
++  assert.ok(Number(newToken) >= bookmarkVersion);
++  bookmarkToken = newToken;
++});
++
++test('commit updates an existing bookmark', async () => {
++  const response = await postCommand(buildCommit([{
++    id: serverId,
++    parentId: '32904_bookmark_bar',
++    version: bookmarkVersion,
++    name: 'Renamed',
++    specifics: bookmarkBytes,
++    folder: false,
++    clientTagHash: 'client-tag-hash',
++  }]));
++  const results = parseCommitResponse(response.body);
++  assert.equal(results[0].responseType, 1);
++  assert.ok(results[0].version > bookmarkVersion);
++  bookmarkVersion = results[0].version;
++
++  const updates = parseGetUpdates(
++      responseHeader((await postCommand(buildGetUpdates({
++        markers: [{type: BOOKMARKS, token: bookmarkToken}],
++      }))).body).getUpdates);
++  const entry = updates.entries.find((item) => item.id === serverId);
++  assert.ok(entry);
++  assert.equal(entry.name, 'Renamed');
++  assert.equal(entry.version, bookmarkVersion);
++  bookmarkToken = updates.markers.find((m) => m.type === BOOKMARKS).token;
++});
++
++test('commit deletes a bookmark and GetUpdates returns a tombstone', async () => {
++  const deleteResponse = await postCommand(buildCommit([{
++    id: serverId,
++    version: bookmarkVersion,
++    deleted: true,
++  }]));
++  const results = parseCommitResponse(deleteResponse.body);
++  assert.equal(results[0].responseType, 1);
++  assert.ok(results[0].version > bookmarkVersion);
++  bookmarkVersion = results[0].version;
++
++  const updates = parseGetUpdates(
++      responseHeader((await postCommand(buildGetUpdates({
++        markers: [{type: BOOKMARKS, token: bookmarkToken}],
++      }))).body).getUpdates);
++  const tombstone = updates.entries.find((item) => item.id === serverId);
++  assert.ok(tombstone);
++  assert.equal(tombstone.deleted, true);
++  assert.equal(entitySpecificsType(tombstone.specifics), BOOKMARKS);
++});
++
++test('requests without a valid token are rejected', async () => {
++  const response = await postCommand(
++      buildGetUpdates({markers: [{type: BOOKMARKS}]}), 'not-a-token');
++  assert.equal(response.status, 401);
++});
++
++test('a stale store birthday returns NOT_MY_BIRTHDAY', async () => {
++  const saved = birthday;
++  birthday = 'stale-birthday';
++  const response = await postCommand(
++      buildGetUpdates({markers: [{type: BOOKMARKS}]}));
++  birthday = saved;
++  const header = responseHeader(response.body);
++  assert.equal(header.errorCode, 2);
++  assert.equal(header.birthday, saved);
++});
++
++test('ClearServerData resets the store', async () => {
++  const cleared = await postCommand(buildClearServerData());
++  assert.equal(responseHeader(cleared.body).errorCode, 0);
++
++  const stale = responseHeader((await postCommand(
++      buildGetUpdates({markers: [{type: BOOKMARKS}]}))).body);
++  assert.equal(stale.errorCode, 2);
++  birthday = stale.birthday;
++
++  const fresh = parseGetUpdates(responseHeader((await postCommand(
++      buildGetUpdates({markers: [{type: BOOKMARKS}]}))).body).getUpdates);
++  const ids = fresh.entries.map((entry) => entry.id);
++  assert.ok(ids.includes('32904_bookmark_bar'));
++  assert.ok(!ids.includes(serverId), 'old bookmark survived ClearServerData');
++});
++
++test('event endpoint accepts reports', async () => {
++  const response = await fetch(`${base}/event/`, {
++    method: 'POST',
++    headers: {
++      'Authorization': `Bearer ${accessToken}`,
++      'Content-Type': 'application/octet-stream',
++    },
++    body: Buffer.from([0x08, 0x00]),
++  });
++  assert.equal(response.status, 200);
++});
+-- 
+2.56.1
+

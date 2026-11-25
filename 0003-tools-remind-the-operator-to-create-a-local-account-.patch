@@ -1,0 +1,41 @@
+From d42f90a05beb78659571cda1f040fe38d2b3d568 Mon Sep 17 00:00:00 2001
+From: "5455945@gmail.com" <5455945@gmail.com>
+Date: Tue, 24 Nov 2026 16:57:36 +0800
+Subject: [PATCH 3/8] tools: remind the operator to create a local account on
+ startup
+
+---
+ tools/afree-login-service/src/server.mjs | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/tools/afree-login-service/src/server.mjs b/tools/afree-login-service/src/server.mjs
+index 0f7a5abc2b..2dc6c0e589 100644
+--- a/tools/afree-login-service/src/server.mjs
++++ b/tools/afree-login-service/src/server.mjs
+@@ -82,6 +82,8 @@ async function main() {
+   const actualPort =
+       typeof address === 'object' && address ? address.port : config.port;
+ 
++  const userCount = store.listUsers().length;
++
+   logger.info('afree login service listening', {
+     url: config.publicUrl,
+     address: `${config.host}:${actualPort}`,
+@@ -99,8 +101,13 @@ Clients on another machine need the address they can reach, for example:
+   node src/cli.mjs gen-gaia-config --url http://<this-machine-ip>:${actualPort} \\
+     > gaia-config.json
+ 
++${userCount === 0 ? `No accounts exist yet. This service does not accept Google
++accounts; create a local account first:
++  printf '%s\\n' 'your-password' | node src/cli.mjs add-user \\
++    --email you@example.com --name "You"` : `Accounts: ${userCount} local account(s) in ${config.dbPath}.`}
++
+ Next steps:
+-  1) create a user:
++  1) create a user (skip if you already have one):
+        node src/cli.mjs add-user --email you@example.com
+   2) write a Chromium gaia config:
+        node src/cli.mjs gen-gaia-config --url ${config.publicUrl} > gaia-config.json
+-- 
+2.56.1
+

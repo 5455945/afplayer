@@ -1,0 +1,3929 @@
+From d5e4ee577e1dd6c0e6140411b587c669210d10b4 Mon Sep 17 00:00:00 2001
+From: "5455945@gmail.com" <5455945@gmail.com>
+Date: Tue, 24 Nov 2026 16:26:32 +0800
+Subject: [PATCH 1/8] tools: add Gaia-compatible afree login service
+
+Add a dependency-free Node.js service that implements the sign-in
+protocol Chromium speaks, so an unmodified client can sign in to it by
+passing --gaia-config.
+
+Protocol details are taken from the Chromium tree:
+  * DICE sign-in is signalled with X-Chrome-ID-Consistency-Response
+    (components/signin/core/browser/dice_header_helper.cc).
+  * /ListAccounts is a cookie-authenticated POST returning
+    base64(binary gaia.ListAccountsResponse)
+    (google_apis/gaia/list_accounts_response.proto).
+  * /oauth2/v4/token handles authorization_code and refresh_token
+    grants (google_apis/gaia/gaia_auth_fetcher.cc).
+  * /oauth/multilogin accepts MultiBearer and returns XSSI-prefixed
+    JSON cookies (google_apis/gaia/oauth_multilogin_result.cc).
+  * GaiaCookieManagerService watches SAPISID on google_url/secure_google_url,
+    so the generated config overrides those origins too.
+
+Contents:
+  * SQLite (node:sqlite) schema for users, sessions, session_accounts,
+    auth codes, refresh/access tokens and audit log.
+  * scrypt password hashing, hashed single-use tokens, login throttle.
+  * Admin CLI for users, sessions and gaia-config generation.
+  * 15 end-to-end protocol tests.
+---
+ tools/afree-login-service/.gitignore          |    6 +
+ tools/afree-login-service/README.md           |  309 ++++
+ tools/afree-login-service/package.json        |   16 +
+ tools/afree-login-service/src/cli.mjs         |  293 ++++
+ tools/afree-login-service/src/config.mjs      |  221 +++
+ tools/afree-login-service/src/db.mjs          |  510 +++++++
+ tools/afree-login-service/src/email.mjs       |   14 +
+ tools/afree-login-service/src/gaia.mjs        | 1278 +++++++++++++++++
+ tools/afree-login-service/src/proto.mjs       |  223 +++
+ tools/afree-login-service/src/schema.sql      |  114 ++
+ tools/afree-login-service/src/server.mjs      |  109 ++
+ tools/afree-login-service/src/views.mjs       |  343 +++++
+ .../test/protocol.test.mjs                    |  355 +++++
+ 13 files changed, 3791 insertions(+)
+ create mode 100644 tools/afree-login-service/.gitignore
+ create mode 100644 tools/afree-login-service/README.md
+ create mode 100644 tools/afree-login-service/package.json
+ create mode 100644 tools/afree-login-service/src/cli.mjs
+ create mode 100644 tools/afree-login-service/src/config.mjs
+ create mode 100644 tools/afree-login-service/src/db.mjs
+ create mode 100644 tools/afree-login-service/src/email.mjs
+ create mode 100644 tools/afree-login-service/src/gaia.mjs
+ create mode 100644 tools/afree-login-service/src/proto.mjs
+ create mode 100644 tools/afree-login-service/src/schema.sql
+ create mode 100644 tools/afree-login-service/src/server.mjs
+ create mode 100644 tools/afree-login-service/src/views.mjs
+ create mode 100644 tools/afree-login-service/test/protocol.test.mjs
+
+diff --git a/tools/afree-login-service/.gitignore b/tools/afree-login-service/.gitignore
+new file mode 100644
+index 0000000000..28c3912dd0
+--- /dev/null
++++ b/tools/afree-login-service/.gitignore
+@@ -0,0 +1,6 @@
++data/
++*.sqlite3
++*.sqlite3-wal
++*.sqlite3-shm
++node_modules/
++gaia-config.json
+diff --git a/tools/afree-login-service/README.md b/tools/afree-login-service/README.md
+new file mode 100644
+index 0000000000..8a44a57b06
+--- /dev/null
++++ b/tools/afree-login-service/README.md
+@@ -0,0 +1,309 @@
++# afree login service
++
++A small, dependency-free Node.js service that speaks the **same sign-in
++protocol as Google Gaia**, so an unmodified (or barely modified) Chromium /
++afree client can sign in to it by pointing `--gaia-config` at it.
++
++- Sign in with your own accounts when the service is configured.
++- Sign in with Google normally when it is not.
++- The client-side protocol is the real one: DICE response headers, binary
++  protobuf for `ListAccounts`, OAuth2 token exchange, MultiBearer
++  `/oauth/multilogin` cookies.
++
++```
++Chromium / afree                         this service                 SQLite
++  │                                          │                          │
++  │ GET /signin/chrome/sync?ssp=1&continue=  │                          │
++  │─────────────────────────────────────────>│  login form (HTML)       │
++  │ POST email+password (same URL)           │                          │
++  │─────────────────────────────────────────>│  verify (scrypt) ───────>│
++  │ 200 + Set-Cookie: SID/LSID/HSID/...      │                          │
++  │     + X-Chrome-ID-Consistency-Response   │  create auth code ──────>│
++  │<─────────────────────────────────────────│                          │
++  │ POST /oauth2/v4/token (authorization_code)│                         │
++  │─────────────────────────────────────────>│  issue tokens ──────────>│
++  │ POST /ListAccounts (cookies)             │  base64 binary proto     │
++  │─────────────────────────────────────────>│                          │
++  │ POST /oauth/multilogin (MultiBearer)     │  )]}' JSON cookies       │
++  │─────────────────────────────────────────>│                          │
++```
++
++## What Chromium actually expects
++
++These are the details that make a "highly compatible" server, all taken from
++the Chromium tree:
++
++| Behaviour | Source of truth |
++| --- | --- |
++| Sign-in URL is `<gaia_url>/signin/chrome/sync?ssp=1` | `google_apis/gaia/gaia_urls.cc` |
++| Login result is a **HTTP response header**, `X-Chrome-ID-Consistency-Response: action=SIGNIN,authuser=0,id=…,email=…,authorization_code=…` | `components/signin/core/browser/dice_header_helper.cc` |
++| That header is only processed for responses on the Gaia origin | `chrome/browser/signin/chrome_signin_helper.cc` |
++| `/ListAccounts` is a **POST with cookies** and returns **base64 of a binary `gaia.ListAccountsResponse`** | `google_apis/gaia/gaia_auth_fetcher.cc`, `google_apis/gaia/gaia_auth_util.cc` |
++| `Account` fields: `display_email=3`, `valid_session=9`, `obfuscated_id=10`, `signed_out=14`, `is_verified=15` | `google_apis/gaia/list_accounts_response.proto` |
++| The cookie listener watches **SAPISID** and `google_url`'s host | `google_apis/gaia/gaia_constants.h`, `components/signin/internal/identity_manager/gaia_cookie_manager_service.cc` |
++| The auth code is exchanged at `<google_apis_origin_url>/oauth2/v4/token` with `grant_type=authorization_code`, `scope`, `client_id`, `client_secret`, `code` | `google_apis/gaia/gaia_auth_fetcher.cc` |
++| `/oauth/multilogin` receives `Authorization: MultiBearer <token>:<gaia_id>,…` and answers `)]}'\n{"status":"OK","cookies":[…]}` | `google_apis/gaia/gaia_auth_fetcher.cc`, `google_apis/gaia/oauth_multilogin_result.cc` |
++| DICE is **disabled** unless an OAuth client id + secret are configured | `chrome/browser/signin/account_consistency_mode_manager.cc` |
++
++That last row is the one that trips people up: a Chromium build with
++`google_api_key=false` cannot sign in at all until an OAuth client is
++configured, because `HasOAuthClientConfigured()` returns false. The generated
++`gaia-config.json` fixes this by setting the API-key entries as well.
++
++## Requirements
++
++- Node.js **>= 22.5** (uses the built-in `node:sqlite` module).
++  This Chromium checkout already ships one:
++  `third_party/node/linux/node-linux-x64/bin/node` (v24, SQLite 3.50).
++- No npm packages, no codegen, no build step.
++
++## Quick start
++
++```sh
++cd tools/afree-login-service
++
++# 1. create an account (reads the password from stdin)
++printf '%s\n' 'your-password' |
++  node src/cli.mjs add-user --email you@example.com --name "You"
++
++# 2. start the service
++node src/server.mjs --host 127.0.0.1 --port 8080
++
++# 3. generate the Chromium config
++node src/cli.mjs gen-gaia-config --url http://127.0.0.1:8080 \
++  > gaia-config.json
++```
++
++Then start the client with the generated config:
++
++```sh
++# Linux
++out/<your-out-dir>/afree \
++  --gaia-config="$PWD/gaia-config.json" \
++  --user-data-dir=/tmp/afree-profile
++
++# Windows (cmd.exe)
++out\winx64r\afree.exe ^
++  --gaia-config=C:\path\to\gaia-config.json ^
++  --user-data-dir=%TEMP%\afree-profile
++```
++
++Open `afree://settings/people`, click **Sign in**, and use the account you
++created. To go back to Google, just drop `--gaia-config`.
++
++If you prefer explicit switches instead of `--gaia-config`:
++
++```sh
++--gaia-url=http://127.0.0.1:8080
++--google-apis-url=http://127.0.0.1:8080
++--lso-url=http://127.0.0.1:8080
++--google-url=http://127.0.0.1:8080
++--oauth2-client-id=afree-client-id
++--oauth2-client-secret=afree-client-secret
++```
++
++But note: `--oauth2-client-id/secret` only fill in `CLIENT_MAIN`; the other
++OAuth clients keep the `dummytoken` sentinel, `HasOAuthClientConfigured()`
++stays false and DICE stays disabled. Prefer `--gaia-config` with the
++`api_keys` block (or set `GOOGLE_DEFAULT_CLIENT_ID` /
++`GOOGLE_DEFAULT_CLIENT_SECRET`).
++
++### HTTPS (recommended for anything but localhost)
++
++Chromium treats `http://127.0.0.1` and `http://localhost` as trustworthy, so
++plain HTTP is fine for local tests. For a real deployment, terminate TLS in
++front of the service and start it with an https origin so `Secure` cookies are
++emitted:
++
++```sh
++node src/server.mjs \
++  --public-url https://login.example.com \
++  --host 127.0.0.1 --port 8080
++```
++
++Then point Chromium at `https://login.example.com`. With a self-signed
++certificate, add `--ignore-certificate-errors` for testing.
++
++## Endpoints
++
++| Method | Path | Purpose |
++| --- | --- | --- |
++| GET | `/signin/chrome/sync` | Sign-in form (`ssp=1`, `continue=`, `flow=`, `email_hint=`) |
++| POST | `/signin/chrome/sync` | Authenticate, set cookies, return the DICE header |
++| GET/POST | `/ServiceLogin`, `/ServiceLoginAuth`, `/AccountChooser`, `/AddSession`, `/embedded/...` | Legacy / edge sign-in entry points |
++| GET/POST | `/ListAccounts` | base64 binary `gaia.ListAccountsResponse` |
++| POST | `/oauth2/v4/token` | `authorization_code` and `refresh_token` grants |
++| GET/POST | `/oauth2/v1/userinfo` | Profile for a Bearer access token |
++| GET/POST | `/oauth2/v2/tokeninfo` | Token introspection |
++| POST | `/oauth/multilogin` | Cookie propagation (`)]}'` prefixed JSON) |
++| GET | `/GetCheckConnectionInfo` | `[]` |
++| GET/POST | `/enable_sync` | `action=ENABLE_SYNC` DICE header |
++| GET/POST | `/Logout` | Clear cookies + `Google-Accounts-SignOut` header |
++| POST | `/o/oauth2/revoke` | Revoke a refresh token |
++| POST | `/RotateBoundCookies` | `400`, DBSC is not implemented |
++| POST | `/reauth/v1beta/users/...` | `400`, reauth is not implemented |
++| GET | `/` | Status page with the endpoint list |
++| GET | `/healthz` | `{"status":"ok"}` |
++
++## Generated `gaia-config.json`
++
++`gen-gaia-config` produces the URL overrides **and** the API-key overrides:
++
++```json
++{
++  "urls": {
++    "google_url":            {"url": "http://127.0.0.1:8080"},
++    "secure_google_url":     {"url": "http://127.0.0.1:8080"},
++    "gaia_url":              {"url": "http://127.0.0.1:8080"},
++    "lso_origin_url":        {"url": "http://127.0.0.1:8080"},
++    "google_apis_origin_url":{"url": "http://127.0.0.1:8080"},
++    "oauth_account_manager_origin_url": {"url": "http://127.0.0.1:8080"},
++    "oauth_account_manager_mtls_origin_url": {"url": "http://127.0.0.1:8080"},
++    "oauth2_mtls_origin_url": {"url": "http://127.0.0.1:8080"},
++    "account_capabilities_origin_url": {"url": "http://127.0.0.1:8080"},
++    "people_api_origin_url":  {"url": "http://127.0.0.1:8080"},
++    "classroom_api_origin_url": {"url": "http://127.0.0.1:8080"},
++    "tasks_api_origin_url":   {"url": "http://127.0.0.1:8080"}
++  },
++  "api_keys": {
++    "GOOGLE_DEFAULT_CLIENT_ID":     "afree-client-id",
++    "GOOGLE_DEFAULT_CLIENT_SECRET": "afree-client-secret",
++    "GOOGLE_CLIENT_ID_MAIN":        "afree-client-id",
++    "GOOGLE_CLIENT_SECRET_MAIN":    "afree-client-secret"
++  }
++}
++```
++
++Why each key matters:
++
++- `gaia_url` — used for the sign-in URL, `/ListAccounts`, `/Logout`,
++  `/oauth/multilogin`, and as the origin that Chromium accepts the DICE header
++  from (`HasGaiaSchemeHostPort`).
++- `google_url` / `secure_google_url` — the cookie listener origin and the host
++  used to validate GAIA cookies. Must match the host that sets the cookies.
++- `google_apis_origin_url` — `/oauth2/v4/token`, `/oauth2/v1/userinfo`,
++  `/oauth2/v2/tokeninfo`.
++- `lso_origin_url` — `/o/oauth2/revoke`.
++- `api_keys` — enables DICE at all (see the warning above).
++
++## Accounts, sessions and tokens
++
++- Passwords are hashed with **scrypt** (N=16384, r=8, p=1, 64-byte key).
++- One **session** per browser sign-in, represented by the `SID` cookie. This is
++  the "multi-device" model: phone, laptop and desktop each create their own
++  session and refresh token.
++- `session_accounts` stores the accounts attached to a session, in order. The
++  first one is the primary account reported by `/ListAccounts`.
++- Authorization codes are single-use, 5 minutes by default and stored hashed.
++- Access tokens live 1 hour; refresh tokens are revocable and by default do not
++  expire (`--refresh-token-ttl-days N` adds an expiry).
++- `audit_log` records `login_success`, `login_failed`, `token_issued`,
++  `logout`, `user_created`.
++
++Cookie values other than `SID` are derived with HMAC-SHA256 from the session id
++and a persistent server secret, so the server can re-emit them on
++`/oauth/multilogin` without storing six extra columns.
++
++### Admin CLI
++
++```sh
++node src/cli.mjs add-user        --email a@b.c [--password -] [--name X]
++node src/cli.mjs list-users
++node src/cli.mjs set-password    --email a@b.c [--password -]
++node src/cli.mjs disable-user    --email a@b.c
++node src/cli.mjs enable-user     --email a@b.c
++node src/cli.mjs delete-user     --email a@b.c
++node src/cli.mjs list-sessions   --email a@b.c
++node src/cli.mjs revoke-sessions --email a@b.c
++node src/cli.mjs prune
++node src/cli.mjs gen-gaia-config [--url https://login.example.com] [--output f]
++```
++
++All commands accept `--db <path>`; the default is `data/afree-login.sqlite3`.
++
++## Service options
++
++```
++--host 127.0.0.1                # bind address
++--port 8080
++--db data/afree-login.sqlite3
++--public-url http://host:port   # origin Chromium uses
++--access-token-ttl 3600
++--refresh-token-ttl-days 0      # 0 = no expiry
++--auth-code-ttl 300
++--session-ttl-days 30
++--log-level info                # debug|info|warn|error|silent
++--allow-registration            # enables /signup
++--redirect-continue             # redirect to ?continue= like Google Gaia
++--allowed-continue-hosts a,b    # allowlist for ?continue=
++--no-oauth-code-cookie          # drop the legacy oauth_code cookie
++```
++
++Environment variables use the `AFREE_LOGIN_` prefix
++(`AFREE_LOGIN_PORT`, `AFREE_LOGIN_PUBLIC_URL`, `AFREE_LOGIN_DB`, ...).
++
++By default the service renders its own "signed in" page after a successful
++login instead of following Chromium's `?continue=https://www.google.com/`,
++which keeps an offline deployment from ending on a network error page. The
++sign-in itself completes through the DICE header either way. Pass
++`--redirect-continue` for Gaia-faithful behaviour.
++
++## Database
++
++SQLite (WAL) through `node:sqlite`; in this tree that is SQLite **3.50.4**.
++Tables: `users`, `sessions`, `session_accounts`, `auth_codes`,
++`refresh_tokens`, `access_tokens`, `audit_log`, `meta`.
++
++The schema is applied idempotently at startup (`src/schema.sql`). `STRICT`
++tables and `PRAGMA foreign_keys = ON` are enabled.
++
++## Tests
++
++```sh
++node --disable-warning=ExperimentalWarning --test test/*.test.mjs
++```
++
++15 protocol tests cover the DICE header, cookie issuance, binary
++`ListAccounts` encoding, token exchange, single-use codes, userinfo,
++MultiBearer multilogin, ENABLE_SYNC and logout.
++
++## Current limitations
++
++- **Sync (bookmarks, history, …) is not implemented.** Sign-in works and the
++  refresh token can be used later for a `--sync-url` backend. Without one,
++  `afree://sync-internals` shows the account but sync stays disabled.
++- **DBSC / `RotateBoundCookies`** is not implemented (returns `400`).
++  `eligible_for_token_binding` is deliberately omitted.
++- **Reauth** (`AccountChooser`, `/reauth/v1beta/...`) is a stub.
++- **Multi-account** is supported by `/ListAccounts` (all accounts in the
++  session, primary first), but `/oauth/multilogin` only re-emits the primary
++  account's cookies; secondary-account cookie families (`__Secure-1PSID`, …)
++  are not modelled.
++- **SAML / embedded setup** for ChromeOS is not implemented.
++- Single-process, in-memory login throttle. For multiple instances, move the
++  throttle to SQLite or a shared cache and terminate TLS in front of the
++  service.
++
++## Security notes
++
++This service authenticates **your own** accounts. Do not import Google
++passwords into it, and do not point a trusted browser profile at an untrusted
++instance.
++
++- Use HTTPS (or loopback) so cookies are set with `Secure`.
++- Keep `data/` out of version control; it contains password hashes, tokens and
++  the cookie-signing secret (`.gitignore` already covers it).
++- `--allowed-continue-hosts` restricts the post-login redirect allowlist; with
++  the default (empty) any http(s) URL is accepted when `--redirect-continue` is
++  enabled.
++- The login page is same-origin and uses `SameSite=Lax` cookies. There is no
++  CSRF token because the form posts to the same URL; if you embed the service
++  behind a multi-origin front end, add one.
++
++## Roadmap
++
++1. `--sync-url` compatible backend for bookmarks/preferences (protobuf
++   `SyncEntity`, `/command` endpoints).
++2. Multi-account cookie families and per-account sign-out.
++3. Device-bound sessions (`RotateBoundCookies`, DBSC).
++4. Password change / account chooser pages.
+diff --git a/tools/afree-login-service/package.json b/tools/afree-login-service/package.json
+new file mode 100644
+index 0000000000..98fc0107ad
+--- /dev/null
++++ b/tools/afree-login-service/package.json
+@@ -0,0 +1,16 @@
++{
++  "name": "afree-login-service",
++  "version": "0.1.0",
++  "private": true,
++  "type": "module",
++  "description": "Gaia-compatible sign-in service for afree/Chromium clients",
++  "license": "BSD-3-Clause",
++  "engines": {
++    "node": ">=22.5"
++  },
++  "scripts": {
++    "start": "node --disable-warning=ExperimentalWarning src/server.mjs",
++    "cli": "node --disable-warning=ExperimentalWarning src/cli.mjs",
++    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.mjs"
++  }
++}
+diff --git a/tools/afree-login-service/src/cli.mjs b/tools/afree-login-service/src/cli.mjs
+new file mode 100644
+index 0000000000..4886e4cec1
+--- /dev/null
++++ b/tools/afree-login-service/src/cli.mjs
+@@ -0,0 +1,293 @@
++#!/usr/bin/env node
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {isEmailShaped} from './email.mjs';
++import {DEFAULT_CONFIG} from './config.mjs';
++
++const CLI_USAGE = `afree login service admin CLI
++
++Usage:
++  node src/cli.mjs <command> [options]
++
++Commands:
++  add-user        --email <email> [--password <pw>|-] [--name <name>]
++                  [--avatar <url>] [--db <path>]
++  list-users      [--db <path>]
++  set-password    --email <email> [--password <pw>|-]
++  disable-user    --email <email>
++  enable-user     --email <email>
++  delete-user     --email <email>
++  list-sessions   --email <email>
++  revoke-sessions --email <email>
++  prune                  Delete expired codes/tokens/sessions
++  gen-gaia-config [--url <origin>] [--client-id <id>]
++                  [--client-secret <secret>] [--output <path>]
++
++Password input:
++  Pass --password - to read one line from stdin, for example:
++    printf '%s\\n' "$PASSWORD" | node src/cli.mjs add-user --email a@b.c --password -
++`;
++
++/** @param {string[]} argv */
++function parseFlags(argv) {
++  /** @type {Record<string, string | boolean>} */
++  const flags = {};
++  /** @type {string[]} */
++  const positional = [];
++  for (let i = 0; i < argv.length; ++i) {
++    const arg = argv[i];
++    if (!arg.startsWith('--')) {
++      positional.push(arg);
++      continue;
++    }
++    const eq = arg.indexOf('=');
++    if (eq !== -1) {
++      flags[arg.slice(2, eq)] = arg.slice(eq + 1);
++      continue;
++    }
++    const name = arg.slice(2);
++    const next = argv[i + 1];
++    if (next !== undefined && !next.startsWith('--')) {
++      flags[name] = next;
++      ++i;
++    } else {
++      flags[name] = true;
++    }
++  }
++  return {flags, positional};
++}
++
++/** @param {Record<string, string | boolean>} flags @param {string} name */
++function requireFlag(flags, name) {
++  const value = flags[name];
++  if (typeof value !== 'string' || value.length === 0) {
++    throw new Error(`--${name} is required`);
++  }
++  return value;
++}
++
++/** @param {Record<string, string | boolean>} flags @param {string} name */
++function optionalFlag(flags, name) {
++  const value = flags[name];
++  return typeof value === 'string' ? value : undefined;
++}
++
++async function readStdinLine() {
++  /** @type {Buffer[]} */
++  const chunks = [];
++  for await (const chunk of process.stdin) {
++    chunks.push(chunk);
++  }
++  return Buffer.concat(chunks).toString('utf8').split('\n')[0].trim();
++}
++
++/** @param {Record<string, string | boolean>} flags */
++async function resolvePassword(flags) {
++  const provided = flags['password'];
++  if (typeof provided === 'string' && provided.length > 0) {
++    return provided === '-' ? await readStdinLine() : provided;
++  }
++  if (provided === true) {
++    throw new Error('--password requires a value (use --password - for stdin)');
++  }
++  throw new Error('--password is required (use --password - to read stdin)');
++}
++
++/** @param {Record<string, string | boolean>} flags */
++async function openStore(flags) {
++  const dbPath = optionalFlag(flags, 'db') ?? DEFAULT_CONFIG.dbPath;
++  const {Store} = await import('./db.mjs');
++  return Store.open(dbPath);
++}
++
++/**
++ * @param {string} url
++ * @param {string} clientId
++ * @param {string} clientSecret
++ */
++function buildGaiaConfig(url, clientId, clientSecret) {
++  const origin = new URL(url).origin;
++  return {
++    urls: {
++      google_url: {url: origin},
++      secure_google_url: {url: origin},
++      gaia_url: {url: origin},
++      lso_origin_url: {url: origin},
++      google_apis_origin_url: {url: origin},
++      oauth_account_manager_origin_url: {url: origin},
++      oauth_account_manager_mtls_origin_url: {url: origin},
++      oauth2_mtls_origin_url: {url: origin},
++      account_capabilities_origin_url: {url: origin},
++      people_api_origin_url: {url: origin},
++      classroom_api_origin_url: {url: origin},
++      tasks_api_origin_url: {url: origin},
++    },
++    api_keys: {
++      GOOGLE_DEFAULT_CLIENT_ID: clientId,
++      GOOGLE_DEFAULT_CLIENT_SECRET: clientSecret,
++      GOOGLE_CLIENT_ID_MAIN: clientId,
++      GOOGLE_CLIENT_SECRET_MAIN: clientSecret,
++    },
++  };
++}
++
++async function main() {
++  const argv = process.argv.slice(2);
++  if (argv.length === 0 || argv[0] === 'help' || argv[0] === '--help') {
++    process.stdout.write(CLI_USAGE);
++    return;
++  }
++  const command = argv[0];
++  const {flags} = parseFlags(argv.slice(1));
++
++  if (command === 'gen-gaia-config') {
++    const config = buildGaiaConfig(
++        optionalFlag(flags, 'url') ?? 'http://127.0.0.1:8080',
++        optionalFlag(flags, 'client-id') ?? 'afree-client-id',
++        optionalFlag(flags, 'client-secret') ?? 'afree-client-secret',
++    );
++    const json = `${JSON.stringify(config, null, 2)}\n`;
++    const output = optionalFlag(flags, 'output');
++    if (output) {
++      const {writeFileSync} = await import('node:fs');
++      writeFileSync(output, json);
++      process.stderr.write(`wrote ${output}\n`);
++    } else {
++      process.stdout.write(json);
++    }
++    return;
++  }
++
++  const store = await openStore(flags);
++  try {
++    switch (command) {
++      case 'add-user': {
++        const email = requireFlag(flags, 'email');
++        if (!isEmailShaped(email)) {
++          throw new Error(`invalid email: ${email}`);
++        }
++        const password = await resolvePassword(flags);
++        if (password.length < 8) {
++          throw new Error('password must be at least 8 characters');
++        }
++        if (store.getUserByEmail(email)) {
++          throw new Error(`user already exists: ${email}`);
++        }
++        const user = store.createUser({
++          email,
++          password,
++          displayName: optionalFlag(flags, 'name') ?? '',
++          avatarUrl: optionalFlag(flags, 'avatar') ?? '',
++        });
++        process.stdout.write(
++            `created ${user.display_email}\n  id:       ${user.id}\n  gaia_id:  ${
++                user.gaia_id}\n`);
++        break;
++      }
++      case 'list-users': {
++        const users = store.listUsers();
++        if (users.length === 0) {
++          process.stdout.write('no users\n');
++          break;
++        }
++        for (const user of users) {
++          process.stdout.write(
++              `${user.disabled ? '[disabled] ' : ''}${user.display_email}\t${
++                  user.gaia_id}\t${user.display_name || '-'}\n`);
++        }
++        break;
++      }
++      case 'set-password': {
++        const email = requireFlag(flags, 'email');
++        const user = store.getUserByEmail(email);
++        if (!user) {
++          throw new Error(`no such user: ${email}`);
++        }
++        const password = await resolvePassword(flags);
++        if (password.length < 8) {
++          throw new Error('password must be at least 8 characters');
++        }
++        store.setPassword(user.id, password);
++        process.stdout.write(`updated password for ${user.display_email}\n`);
++        break;
++      }
++      case 'disable-user':
++      case 'enable-user': {
++        const email = requireFlag(flags, 'email');
++        const user = store.getUserByEmail(email);
++        if (!user) {
++          throw new Error(`no such user: ${email}`);
++        }
++        const disabled = command === 'disable-user';
++        store.setDisabled(user.id, disabled);
++        if (disabled) {
++          store.revokeSessionByUser(user.id);
++        }
++        process.stdout.write(
++            `${disabled ? 'disabled' : 'enabled'} ${user.display_email}\n`);
++        break;
++      }
++      case 'list-sessions': {
++        const email = requireFlag(flags, 'email');
++        const user = store.getUserByEmail(email);
++        if (!user) {
++          throw new Error(`no such user: ${email}`);
++        }
++        const sessions = store.listSessionsByUser(user.id);
++        if (sessions.length === 0) {
++          process.stdout.write('no sessions\n');
++          break;
++        }
++        const formatTime = (seconds) =>
++          seconds ? new Date(seconds * 1000).toISOString() : '-';
++        for (const session of sessions) {
++          const state = session.revoked_at ?
++              'revoked' :
++              (session.expires_at * 1000 < Date.now() ? 'expired' : 'active');
++          process.stdout.write(
++              `${state}\tcreated=${formatTime(session.created_at)}\t` +
++              `last_seen=${formatTime(session.last_seen_at)}\t` +
++              `ip=${session.ip || '-'}\tdevice=${session.device_name || '-'}\n`);
++        }
++        break;
++      }
++      case 'revoke-sessions': {
++        const email = requireFlag(flags, 'email');
++        const user = store.getUserByEmail(email);
++        if (!user) {
++          throw new Error(`no such user: ${email}`);
++        }
++        store.revokeSessionByUser(user.id);
++        process.stdout.write(`revoked all sessions for ${user.display_email}\n`);
++        break;
++      }
++      case 'delete-user': {
++        const email = requireFlag(flags, 'email');
++        const user = store.getUserByEmail(email);
++        if (!user) {
++          throw new Error(`no such user: ${email}`);
++        }
++        store.deleteUser(user.id);
++        process.stdout.write(`deleted ${user.display_email}\n`);
++        break;
++      }
++      case 'prune': {
++        store.pruneExpired();
++        process.stdout.write('pruned expired rows\n');
++        break;
++      }
++      default:
++        process.stderr.write(`unknown command: ${command}\n\n${CLI_USAGE}`);
++        process.exitCode = 2;
++    }
++  } finally {
++    store.close();
++  }
++}
++
++main().catch((error) => {
++  process.stderr.write(`error: ${error?.message ?? error}\n`);
++  process.exit(1);
++});
+diff --git a/tools/afree-login-service/src/config.mjs b/tools/afree-login-service/src/config.mjs
+new file mode 100644
+index 0000000000..6c8b22727d
+--- /dev/null
++++ b/tools/afree-login-service/src/config.mjs
+@@ -0,0 +1,221 @@
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {fileURLToPath} from 'node:url';
++import path from 'node:path';
++
++export const projectRoot =
++    path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
++
++const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
++
++/** @param {string} host */
++export function isLoopbackHost(host) {
++  return LOOPBACK_HOSTS.has(host);
++}
++
++/**
++ * @typedef {object} Config
++ * @property {string} host
++ * @property {number} port
++ * @property {string} dbPath
++ * @property {string} publicUrl
++ * @property {string} cookieHost
++ * @property {boolean} secureCookies
++ * @property {number} accessTokenTtlSeconds
++ * @property {number} refreshTokenTtlDays
++ * @property {number} authCodeTtlSeconds
++ * @property {number} sessionTtlDays
++ * @property {string} logLevel
++ * @property {boolean} allowRegistration
++ * @property {string[]} allowedContinueHosts
++ * @property {boolean} emitOAuthCodeCookie
++ * @property {boolean} redirectContinue
++ */
++
++/** @type {Config} */
++export const DEFAULT_CONFIG = {
++  host: '127.0.0.1',
++  port: 8080,
++  dbPath: path.join(projectRoot, 'data', 'afree-login.sqlite3'),
++  publicUrl: '',
++  cookieHost: '',
++  secureCookies: false,
++  accessTokenTtlSeconds: 3600,
++  refreshTokenTtlDays: 0,
++  authCodeTtlSeconds: 300,
++  sessionTtlDays: 30,
++  logLevel: 'info',
++  allowRegistration: false,
++  allowedContinueHosts: [],
++  emitOAuthCodeCookie: true,
++  // Real Gaia redirects to the ?continue= URL after sign-in. Chromium sets it
++  // to the Google base URL, which is often unreachable on a self-hosted
++  // deployment, so the default here renders the local "signed in" page
++  // instead. The DICE header is sent either way.
++  redirectContinue: false,
++};
++
++const NUMBER_FLAGS = new Map([
++  ['port', 'port'],
++  ['access-token-ttl', 'accessTokenTtlSeconds'],
++  ['refresh-token-ttl-days', 'refreshTokenTtlDays'],
++  ['auth-code-ttl', 'authCodeTtlSeconds'],
++  ['session-ttl-days', 'sessionTtlDays'],
++]);
++
++const STRING_FLAGS = new Map([
++  ['host', 'host'],
++  ['db', 'dbPath'],
++  ['public-url', 'publicUrl'],
++  ['log-level', 'logLevel'],
++]);
++
++const ENV_PREFIX = 'AFREE_LOGIN_';
++
++/**
++ * @param {string[]} argv
++ * @returns {Config}
++ */
++export function loadConfig(argv = process.argv.slice(2)) {
++  /** @type {Record<string, unknown>} */
++  const config = {...DEFAULT_CONFIG};
++
++  for (const [flag, key] of STRING_FLAGS) {
++    const env = process.env[ENV_PREFIX + flag.toUpperCase().replaceAll('-', '_')];
++    if (env) {
++      config[key] = env;
++    }
++  }
++  for (const [flag, key] of NUMBER_FLAGS) {
++    const env = process.env[ENV_PREFIX + flag.toUpperCase().replaceAll('-', '_')];
++    if (env) {
++      config[key] = Number(env);
++    }
++  }
++
++  for (let i = 0; i < argv.length; ++i) {
++    const arg = argv[i];
++    if (!arg.startsWith('--')) {
++      throw new Error(`unexpected argument: ${arg}`);
++    }
++    const eq = arg.indexOf('=');
++    const name = eq === -1 ? arg.slice(2) : arg.slice(2, eq);
++    const inlineValue = eq === -1 ? null : arg.slice(eq + 1);
++    /** @returns {string} */
++    const nextValue = () => {
++      if (inlineValue !== null) {
++        return inlineValue;
++      }
++      if (i + 1 >= argv.length) {
++        throw new Error(`--${name} requires a value`);
++      }
++      return argv[++i];
++    };
++
++    if (NUMBER_FLAGS.has(name)) {
++      const value = Number(nextValue());
++      if (!Number.isFinite(value) || value < 0) {
++        throw new Error(`--${name} must be a non-negative number`);
++      }
++      config[NUMBER_FLAGS.get(name)] = value;
++    } else if (STRING_FLAGS.has(name)) {
++      config[STRING_FLAGS.get(name)] = nextValue();
++    } else if (name === 'allow-registration') {
++      config.allowRegistration = true;
++    } else if (name === 'redirect-continue') {
++      config.redirectContinue = true;
++    } else if (name === 'no-oauth-code-cookie') {
++      config.emitOAuthCodeCookie = false;
++    } else if (name === 'allowed-continue-hosts') {
++      config.allowedContinueHosts = nextValue()
++                                        .split(',')
++                                        .map((value) => value.trim())
++                                        .filter(Boolean);
++    } else {
++      throw new Error(`unknown option: --${name}`);
++    }
++  }
++
++  const publicUrl = /** @type {string} */ (config.publicUrl) ||
++      `http://${displayHost(/** @type {string} */ (config.host))}:${
++          /** @type {number} */ (config.port)}/`;
++  const parsedPublicUrl = new URL(publicUrl);
++  if (!['http:', 'https:'].includes(parsedPublicUrl.protocol)) {
++    throw new Error('--public-url must be an http:// or https:// URL');
++  }
++  config.publicUrl = parsedPublicUrl.origin;
++  config.cookieHost = parsedPublicUrl.hostname;
++  config.secureCookies = parsedPublicUrl.protocol === 'https:';
++
++  return /** @type {Config} */ (config);
++}
++
++/**
++ * `0.0.0.0`/`::` are bind addresses, not something a client can dial.
++ * @param {string} host
++ */
++function displayHost(host) {
++  if (host === '0.0.0.0' || host === '::' || host === '') {
++    return '127.0.0.1';
++  }
++  return host.includes(':') ? `[${host}]` : host;
++}
++
++export const USAGE = `afree login service (Gaia-compatible)
++
++Usage:
++  node src/server.mjs [options]
++  node src/cli.mjs <command> [options]
++
++Options:
++  --host <addr>                  Bind address (default 127.0.0.1)
++  --port <port>                  TCP port (default 8080)
++  --db <path>                    SQLite database file
++  --public-url <url>             Origin Chromium uses to reach this service
++                                 (default http://<host>:<port>)
++  --access-token-ttl <seconds>   Access token lifetime (default 3600)
++  --refresh-token-ttl-days <n>   Refresh token lifetime, 0 = no expiry
++  --auth-code-ttl <seconds>      Authorization code lifetime (default 300)
++  --session-ttl-days <n>         Browser session lifetime (default 30)
++  --log-level <level>            debug|info|warn|error|silent (default info)
++  --allow-registration           Enable the optional /signup page
++  --redirect-continue            Redirect to ?continue= after sign-in like
++                                 Google Gaia does (default: show a local page)
++  --allowed-continue-hosts <h>   Comma separated allowlist for ?continue=
++                                 (default: allow any http(s) URL)
++  --no-oauth-code-cookie         Do not emit the legacy oauth_code cookie
++
++Environment variables use the AFREE_LOGIN_ prefix, for example
++AFREE_LOGIN_PORT=9000 or AFREE_LOGIN_PUBLIC_URL=https://login.example.com.
++`;
++
++/** @param {string} level */
++export function createLogger(level = 'info') {
++  const priorities = {debug: 10, info: 20, warn: 30, error: 40, silent: 100};
++  const threshold = priorities[level] ?? priorities.info;
++  /**
++   * @param {keyof priorities} severity
++   * @param {string} message
++   * @param {object} [fields]
++   */
++  const emit = (severity, message, fields) => {
++    if (priorities[severity] < threshold) {
++      return;
++    }
++    const line = {
++      level: severity,
++      time: new Date().toISOString(),
++      message,
++      ...(fields ?? {}),
++    };
++    process.stderr.write(`${JSON.stringify(line)}\n`);
++  };
++  return {
++    debug: (message, fields) => emit('debug', message, fields),
++    info: (message, fields) => emit('info', message, fields),
++    warn: (message, fields) => emit('warn', message, fields),
++    error: (message, fields) => emit('error', message, fields),
++  };
++}
+diff --git a/tools/afree-login-service/src/db.mjs b/tools/afree-login-service/src/db.mjs
+new file mode 100644
+index 0000000000..95b4be6cae
+--- /dev/null
++++ b/tools/afree-login-service/src/db.mjs
+@@ -0,0 +1,510 @@
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import {randomBytes, createHash, randomInt, scryptSync, timingSafeEqual} from 'node:crypto';
++import {mkdirSync, readFileSync} from 'node:fs';
++import {dirname} from 'node:path';
++import {DatabaseSync} from 'node:sqlite';
++import {canonicalizeEmail} from './email.mjs';
++
++/** @param {string} value */
++export function sha256(value) {
++  return createHash('sha256').update(value).digest('base64url');
++}
++
++/** Returns a 256-bit URL-safe random token. */
++export function randomToken() {
++  return randomBytes(32).toString('base64url');
++}
++
++/** Returns a Gaia-style opaque account id: a 21 digit decimal string. */
++export function randomGaiaId() {
++  // First digit is 1-9 so the value never has a leading zero.
++  let id = String(randomInt(1, 10));
++  while (id.length < 21) {
++    id += String(randomInt(0, 10));
++  }
++  return id;
++}
++
++const SCRYPT_N = 16384;
++const SCRYPT_R = 8;
++const SCRYPT_P = 1;
++const SCRYPT_KEYLEN = 64;
++
++/**
++ * Hashes a password with scrypt. The format is
++ * `scrypt$<N>$<r>$<p>$<salt-b64>$<hash-b64>`.
++ * @param {string} password
++ * @returns {string}
++ */
++export function hashPassword(password) {
++  const salt = randomBytes(16);
++  const derived = scryptSync(password, salt, SCRYPT_KEYLEN, {
++    N: SCRYPT_N,
++    r: SCRYPT_R,
++    p: SCRYPT_P,
++    maxmem: 128 * SCRYPT_N * SCRYPT_R * 2,
++  });
++  return [
++    'scrypt',
++    SCRYPT_N,
++    SCRYPT_R,
++    SCRYPT_P,
++    salt.toString('base64'),
++    derived.toString('base64'),
++  ].join('$');
++}
++
++/**
++ * @param {string} password
++ * @param {string} encoded
++ * @returns {boolean}
++ */
++export function verifyPassword(password, encoded) {
++  const parts = encoded.split('$');
++  if (parts.length !== 6 || parts[0] !== 'scrypt') {
++    return false;
++  }
++  const [, n, r, p, saltB64, hashB64] = parts;
++  const salt = Buffer.from(saltB64, 'base64');
++  const expected = Buffer.from(hashB64, 'base64');
++  let derived;
++  try {
++    derived = scryptSync(password, salt, expected.length, {
++      N: Number(n),
++      r: Number(r),
++      p: Number(p),
++      maxmem: 128 * Number(n) * Number(r) * 2,
++    });
++  } catch {
++    return false;
++  }
++  return derived.length === expected.length &&
++      timingSafeEqual(derived, expected);
++}
++
++/**
++ * Thin wrapper around node:sqlite with the queries the service needs.
++ */export class Store {
++  /**
++   * @param {import('node:sqlite').DatabaseSync} db
++   */
++  constructor(db) {
++    this.db = db;
++  }
++
++  /**
++   * Opens (and migrates) the database.
++   * @param {string} path
++   * @returns {Store}
++   */
++  static open(path) {
++    if (path !== ':memory:') {
++      mkdirSync(dirname(path), {recursive: true});
++    }
++    const db = new DatabaseSync(path);
++    db.exec('PRAGMA journal_mode = WAL;');
++    db.exec('PRAGMA synchronous = NORMAL;');
++    db.exec('PRAGMA foreign_keys = ON;');
++    db.exec('PRAGMA busy_timeout = 5000;');
++    const schema = readFileSync(new URL('./schema.sql', import.meta.url), 'utf8');
++    db.exec(schema);
++    return new Store(db);
++  }
++
++  close() {
++    this.db.close();
++  }
++
++  // ---------------------------------------------------------------- meta
++
++  getMeta(key) {
++    const row = this.db.prepare('SELECT value FROM meta WHERE key = ?').get(key);
++    return row ? row.value : null;
++  }
++
++  setMeta(key, value) {
++    this.db
++        .prepare(
++            'INSERT INTO meta(key, value) VALUES(?, ?) ' +
++            'ON CONFLICT(key) DO UPDATE SET value = excluded.value')
++        .run(key, value);
++  }
++
++  /** Returns the persistent HMAC secret, creating it on first start. */
++  getOrCreateSecret() {
++    const existing = this.getMeta('cookie_secret');
++    if (existing) {
++      return existing;
++    }
++    const secret = randomBytes(32).toString('base64url');
++    this.setMeta('cookie_secret', secret);
++    return secret;
++  }
++
++  // --------------------------------------------------------------- users
++
++  createUser({
++    email,
++    password,
++    displayName = '',
++    avatarUrl = '',
++    emailVerified = true,
++  }) {
++    const canonical = canonicalizeEmail(email);
++    const now = Math.floor(Date.now() / 1000);
++    const id = randomToken();
++    const gaiaId = randomGaiaId();
++    this.db
++        .prepare(
++            'INSERT INTO users(' +
++            'id, email, display_email, password_hash, gaia_id, display_name,' +
++            ' avatar_url, email_verified, created_at, updated_at' +
++            ') VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
++        .run(
++            id,
++            canonical,
++            String(email).trim(),
++            hashPassword(password),
++            gaiaId,
++            displayName,
++            avatarUrl,
++            emailVerified ? 1 : 0,
++            now,
++            now,
++        );
++    return this.getUserById(id);
++  }
++
++  getUserById(id) {
++    return this.db.prepare('SELECT * FROM users WHERE id = ?').get(id) ??
++        null;
++  }
++
++  getUserByEmail(email) {
++    return this.db
++               .prepare('SELECT * FROM users WHERE email = ?')
++               .get(canonicalizeEmail(email)) ??
++        null;
++  }
++
++  listUsers() {
++    return this.db
++        .prepare(
++            'SELECT id, email, display_email, gaia_id, display_name, disabled,' +
++            ' created_at FROM users ORDER BY created_at')
++        .all();
++  }
++
++  setPassword(userId, password) {
++    this.db
++        .prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?')
++        .run(
++            hashPassword(password),
++            Math.floor(Date.now() / 1000),
++            userId,
++        );
++  }
++
++  setDisabled(userId, disabled) {
++    this.db
++        .prepare('UPDATE users SET disabled = ?, updated_at = ? WHERE id = ?')
++        .run(
++            disabled ? 1 : 0,
++            Math.floor(Date.now() / 1000),
++            userId,
++        );
++  }
++
++  deleteUser(userId) {
++    this.db.prepare('DELETE FROM users WHERE id = ?').run(userId);
++  }
++
++  // ------------------------------------------------------------ sessions
++
++  /**
++   * Creates a new GAIA-style session ("SID" cookie).
++   * @param {string} primaryUserId
++   * @param {{deviceId?: string, deviceName?: string, userAgent?: string,
++   *          ip?: string, ttlSeconds: number}} options
++   */
++  createSession(primaryUserId, options) {
++    const now = Math.floor(Date.now() / 1000);
++    const id = randomToken();
++    this.db
++        .prepare(
++            'INSERT INTO sessions(' +
++            'id, primary_user_id, device_id, device_name, user_agent, ip,' +
++            ' created_at, last_seen_at, expires_at' +
++            ') VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)')
++        .run(
++            id,
++            primaryUserId,
++            options.deviceId ?? '',
++            options.deviceName ?? '',
++            options.userAgent ?? '',
++            options.ip ?? '',
++            now,
++            now,
++            now + options.ttlSeconds,
++        );
++    this.addAccountToSession(id, primaryUserId);
++    return id;
++  }
++
++  addAccountToSession(sessionId, userId) {
++    const existing = this.db
++                         .prepare(
++                             'SELECT position FROM session_accounts ' +
++                             'WHERE session_id = ? AND user_id = ?')
++                         .get(sessionId, userId);
++    if (existing) {
++      return existing.position;
++    }
++    const row = this.db
++                    .prepare(
++                        'SELECT COALESCE(MAX(position), -1) + 1 AS position ' +
++                        'FROM session_accounts WHERE session_id = ?')
++                    .get(sessionId);
++    const position = row.position;
++    this.db
++        .prepare(
++            'INSERT INTO session_accounts(session_id, user_id, position,' +
++            ' added_at) VALUES(?, ?, ?, ?)')
++        .run(sessionId, userId, position, Math.floor(Date.now() / 1000));
++    return position;
++  }
++
++  getSession(sessionId) {
++    return this.db
++               .prepare('SELECT * FROM sessions WHERE id = ?')
++               .get(sessionId) ??
++        null;
++  }
++
++  getSessionAccounts(sessionId) {
++    return this.db
++        .prepare(
++            'SELECT sa.position, u.* FROM session_accounts sa ' +
++            'JOIN users u ON u.id = sa.user_id ' +
++            'WHERE sa.session_id = ? ORDER BY sa.position')
++        .all(sessionId);
++  }
++
++  /** Returns the account position for `userId` in `sessionId`, or -1. */
++  getAccountPosition(sessionId, userId) {
++    const row = this.db
++                    .prepare(
++                        'SELECT position FROM session_accounts ' +
++                        'WHERE session_id = ? AND user_id = ?')
++                    .get(sessionId, userId);
++    return row ? row.position : -1;
++  }
++
++  touchSession(sessionId) {
++    this.db
++        .prepare('UPDATE sessions SET last_seen_at = ? WHERE id = ?')
++        .run(Math.floor(Date.now() / 1000), sessionId);
++  }
++
++  revokeSession(sessionId) {
++    this.db
++        .prepare('UPDATE sessions SET revoked_at = ? WHERE id = ?')
++        .run(Math.floor(Date.now() / 1000), sessionId);
++  }
++
++  revokeSessionByUser(userId) {
++    this.db
++        .prepare(
++            'UPDATE sessions SET revoked_at = ? WHERE primary_user_id = ?')
++        .run(Math.floor(Date.now() / 1000), userId);
++  }
++
++  /** @param {string} userId */
++  listSessionsByUser(userId) {
++    return this.db
++        .prepare(
++            'SELECT id, device_id, device_name, ip, user_agent, created_at,' +
++            ' last_seen_at, expires_at, revoked_at FROM sessions ' +
++            'WHERE primary_user_id = ? ORDER BY last_seen_at DESC')
++        .all(userId);
++  }
++
++  // ----------------------------------------------------------- auth codes
++
++  createAuthCode({
++    userId,
++    clientId = '',
++    redirectUri = '',
++    scope = '',
++    deviceId = '',
++    ttlSeconds,
++  }) {
++    const code = randomToken();
++    const now = Math.floor(Date.now() / 1000);
++    this.db
++        .prepare(
++            'INSERT INTO auth_codes(' +
++            'code_hash, user_id, client_id, redirect_uri, scope, device_id,' +
++            ' created_at, expires_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)')
++        .run(
++            sha256(code),
++            userId,
++            clientId,
++            redirectUri,
++            scope,
++            deviceId,
++            now,
++            now + ttlSeconds,
++        );
++    return code;
++  }
++
++  /**
++   * Consumes a single-use authorization code. Returns the row on success.
++   * The UPDATE ... WHERE used_at IS NULL makes this atomic.
++   */
++  consumeAuthCode(code) {
++    const now = Math.floor(Date.now() / 1000);
++    const hash = sha256(code);
++    const result = this.db
++                       .prepare(
++                           'UPDATE auth_codes SET used_at = ? ' +
++                           'WHERE code_hash = ? AND used_at IS NULL ' +
++                           'AND expires_at > ?')
++                       .run(now, hash, now);
++    if (result.changes !== 1) {
++      return null;
++    }
++    return this.db.prepare('SELECT * FROM auth_codes WHERE code_hash = ?').get(hash) ??
++        null;
++  }
++
++  // -------------------------------------------------------- refresh token
++
++  createRefreshToken({
++    userId,
++    clientId = '',
++    scope = '',
++    deviceId = '',
++    deviceName = '',
++    ttlDays = 0,
++  }) {
++    const token = randomToken();
++    const now = Math.floor(Date.now() / 1000);
++    this.db
++        .prepare(
++            'INSERT INTO refresh_tokens(' +
++            'token_hash, user_id, client_id, scope, device_id, device_name,' +
++            ' created_at, expires_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)')
++        .run(
++            sha256(token),
++            userId,
++            clientId,
++            scope,
++            deviceId,
++            deviceName,
++            now,
++            ttlDays > 0 ? now + ttlDays * 86400 : null,
++        );
++    return token;
++  }
++
++  getRefreshToken(token) {
++    const row = this.db
++                    .prepare('SELECT * FROM refresh_tokens WHERE token_hash = ?')
++                    .get(sha256(token));
++    if (!row || row.revoked_at) {
++      return null;
++    }
++    const now = Math.floor(Date.now() / 1000);
++    if (row.expires_at && row.expires_at <= now) {
++      return null;
++    }
++    this.db
++        .prepare('UPDATE refresh_tokens SET last_used_at = ? WHERE token_hash = ?')
++        .run(now, row.token_hash);
++    return row;
++  }
++
++  revokeRefreshToken(token) {
++    const result = this.db
++                       .prepare(
++                           'UPDATE refresh_tokens SET revoked_at = ? ' +
++                           'WHERE token_hash = ? AND revoked_at IS NULL')
++                       .run(Math.floor(Date.now() / 1000), sha256(token));
++    return result.changes === 1;
++  }
++
++  // --------------------------------------------------------- access token
++
++  createAccessToken({
++    userId,
++    refreshTokenHash = null,
++    clientId = '',
++    scope = '',
++    ttlSeconds,
++  }) {
++    const token = randomToken();
++    const now = Math.floor(Date.now() / 1000);
++    this.db
++        .prepare(
++            'INSERT INTO access_tokens(' +
++            'token_hash, user_id, refresh_token_hash, client_id, scope,' +
++            ' created_at, expires_at) VALUES(?, ?, ?, ?, ?, ?, ?)')
++        .run(
++            sha256(token),
++            userId,
++            refreshTokenHash,
++            clientId,
++            scope,
++            now,
++            now + ttlSeconds,
++        );
++    return token;
++  }
++
++  getAccessToken(token) {
++    const row = this.db
++                    .prepare('SELECT * FROM access_tokens WHERE token_hash = ?')
++                    .get(sha256(token));
++    if (!row || row.revoked_at) {
++      return null;
++    }
++    if (row.expires_at <= Math.floor(Date.now() / 1000)) {
++      return null;
++    }
++    return row;
++  }
++
++  // -------------------------------------------------------------- audit
++
++  audit({userId = null, event, detail = '', ip = '', userAgent = ''}) {
++    this.db
++        .prepare(
++            'INSERT INTO audit_log(user_id, event, detail, ip, user_agent,' +
++            ' created_at) VALUES(?, ?, ?, ?, ?, ?)')
++        .run(
++            userId,
++            event,
++            detail,
++            ip,
++            userAgent,
++            Math.floor(Date.now() / 1000),
++        );
++  }
++
++  pruneExpired(now = Math.floor(Date.now() / 1000)) {
++    this.db.prepare('DELETE FROM auth_codes WHERE expires_at < ?').run(now);
++    this.db
++        .prepare(
++            'DELETE FROM access_tokens WHERE expires_at < ? OR revoked_at IS NOT NULL')
++        .run(now);
++    this.db
++        .prepare('DELETE FROM sessions WHERE expires_at < ? OR revoked_at IS NOT NULL')
++        .run(now);
++  }
++}
++
+diff --git a/tools/afree-login-service/src/email.mjs b/tools/afree-login-service/src/email.mjs
+new file mode 100644
+index 0000000000..8fb5920d47
+--- /dev/null
++++ b/tools/afree-login-service/src/email.mjs
+@@ -0,0 +1,14 @@
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++/** Canonicalizes an email address the way Gaia does for lookups. */
++export function canonicalizeEmail(email) {
++  return String(email).trim().toLowerCase();
++}
++
++export function isEmailShaped(email) {
++  const value = String(email);
++  return value.length > 2 && value.length <= 254 &&
++      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value);
++}
+diff --git a/tools/afree-login-service/src/gaia.mjs b/tools/afree-login-service/src/gaia.mjs
+new file mode 100644
+index 0000000000..5981f94269
+--- /dev/null
++++ b/tools/afree-login-service/src/gaia.mjs
+@@ -0,0 +1,1278 @@
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Gaia-compatible HTTP surface for Chromium sign-in.
++//
++// The endpoints and wire formats below are derived from Chromium's own
++// FakeGaia implementation and from the real request/response shapes:
++//
++//   google_apis/gaia/fake_gaia.cc
++//   google_apis/gaia/gaia_auth_fetcher.cc
++//   google_apis/gaia/gaia_auth_util.cc
++//   google_apis/gaia/list_accounts_response.proto
++//   components/signin/core/browser/dice_header_helper.cc
++//   components/signin/internal/identity_manager/gaia_cookie_manager_service.cc
++//
++// In particular:
++//   * /ListAccounts is a POST with cookies and returns
++//     base64(binary gaia.ListAccountsResponse), not JSON.
++//   * The sign-in result is signalled to Chromium with the
++//     X-Chrome-ID-Consistency-Response header, not with a cookie.
++//   * /oauth/multilogin returns JSON with the XSSI prefix ")]}'\n".
++
++import {createHmac} from 'node:crypto';
++import {hashPassword, sha256, verifyPassword} from './db.mjs';
++import {canonicalizeEmail} from './email.mjs';
++import {encodeListAccountsResponseBase64} from './proto.mjs';
++import {
++  renderErrorPage,
++  renderIndexPage,
++  renderLoginPage,
++  renderSignedInPage,
++  renderSignedOutPage,
++  renderSignupPage,
++} from './views.mjs';
++
++// Cookie names Chromium expects to find for a signed-in GAIA session.
++// SAPISID is the name the cookie listener in GaiaCookieManagerService watches
++// (gaia_constants.h: kGaiaSigninCookieName).
++const GAIA_COOKIE_NAMES = ['SID', 'LSID', 'HSID', 'SSID', 'APISID', 'SAPISID'];
++
++const DICE_HEADER = 'X-Chrome-ID-Consistency-Response';
++const SIGNOUT_HEADER = 'Google-Accounts-SignOut';
++const XSSI_PREFIX = ")]}'\n";
++
++// Used to keep the response time of "unknown user" and "wrong password"
++// roughly equal. Contains no secret.
++const DUMMY_PASSWORD_HASH = hashPassword('afree-dummy-password');
++
++const MAX_BODY_BYTES = 256 * 1024;
++const MAX_PASSWORD_LENGTH = 4096;
++
++// All of these load the sign-in form. Chromium normally uses
++// /signin/chrome/sync, the others exist for the older/edge sign-in flows.
++const SIGNIN_PATHS = new Set([
++  '/signin/chrome/sync',
++  '/ServiceLogin',
++  '/ServiceLoginAuth',
++  '/AccountChooser',
++  '/AddSession',
++  '/embedded/setup/chrome/usermenu',
++  '/embedded/xreauth/chrome',
++]);
++
++// The scope Chromium uses when it exchanges the sign-in authorization code.
++// Mirrors GaiaConstants::kOAuth1LoginScope.
++const OAUTH1_LOGIN_SCOPE = 'https://www.googleapis.com/auth/oauth2login';
++
++/** @param {string} headerValue */
++function parseCookieHeader(headerValue) {
++  /** @type {Map<string, string>} */
++  const cookies = new Map();
++  if (!headerValue) {
++    return cookies;
++  }
++  for (const part of headerValue.split(';')) {
++    const index = part.indexOf('=');
++    if (index === -1) {
++      continue;
++    }
++    const name = part.slice(0, index).trim();
++    if (!name || cookies.has(name)) {
++      continue;
++    }
++    cookies.set(name, part.slice(index + 1).trim());
++  }
++  return cookies;
++}
++
++/** @param {import('node:http').IncomingMessage} req */
++async function readBody(req) {
++  /** @type {Buffer[]} */
++  const chunks = [];
++  let total = 0;
++  for await (const chunk of req) {
++    total += chunk.length;
++    if (total > MAX_BODY_BYTES) {
++      const error = new Error('request body too large');
++      // @ts-ignore
++      error.statusCode = 413;
++      throw error;
++    }
++    chunks.push(chunk);
++  }
++  return Buffer.concat(chunks).toString('utf8');
++}
++
++/** @param {import('node:http').ServerResponse} res */
++function send(res, status, headers, body) {
++  res.writeHead(status, {
++    'X-Content-Type-Options': 'nosniff',
++    'Referrer-Policy': 'no-referrer',
++    ...headers,
++  });
++  res.end(body);
++}
++
++function sendText(res, status, body, headers = {}) {
++  send(
++      res,
++      status,
++      {'Content-Type': 'text/plain; charset=utf-8', ...headers},
++      body,
++  );
++}
++
++function sendHtml(res, status, body, headers = {}) {
++  send(
++      res,
++      status,
++      {'Content-Type': 'text/html; charset=utf-8', ...headers},
++      body,
++  );
++}
++
++function sendJson(res, status, value, headers = {}) {
++  send(
++      res,
++      status,
++      {'Content-Type': 'application/json; charset=utf-8', ...headers},
++      JSON.stringify(value),
++  );
++}
++
++function sendXssiJson(res, status, value, headers = {}) {
++  send(
++      res,
++      status,
++      {'Content-Type': 'application/json; charset=utf-8', ...headers},
++      XSSI_PREFIX + JSON.stringify(value),
++  );
++}
++
++function redirect(res, location, headers = {}) {
++  send(
++      res,
++      302,
++      {'Content-Type': 'text/plain; charset=utf-8', Location: location, ...headers},
++      '',
++  );
++}
++
++function base64urlJson(value) {
++  return Buffer.from(JSON.stringify(value)).toString('base64url');
++}
++
++/**
++ * Signs a compact JWT with HS256. Chromium does not verify the signature of
++ * the id_token it receives directly from the token endpoint, but emitting a
++ * well-formed token keeps the payload usable by other tooling.
++ */
++function signJwt(secret, payload) {
++  const header = {alg: 'HS256', typ: 'JWT', kid: 'afree-signin-1'};
++  const signingInput = `${base64urlJson(header)}.${base64urlJson(payload)}`;
++  const signature = createHmac('sha256', secret)
++                        .update(signingInput)
++                        .digest('base64url');
++  return `${signingInput}.${signature}`;
++}
++
++/**
++ * Simple in-memory brute-force throttle. Enough for a single-process service;
++ * a multi-node deployment should move this to SQLite/Redis.
++ */
++class LoginThrottle {
++  constructor() {
++    /** @type {Map<string, {failures: number, blockedUntil: number}>} */
++    this.entries = new Map();
++  }
++
++  /** @param {string} key */
++  isBlocked(key) {
++    const entry = this.entries.get(key);
++    if (!entry) {
++      return 0;
++    }
++    const now = Date.now();
++    if (entry.blockedUntil > now) {
++      return Math.ceil((entry.blockedUntil - now) / 1000);
++    }
++    return 0;
++  }
++
++  /** @param {string} key */
++  recordFailure(key) {
++    const now = Date.now();
++    const entry = this.entries.get(key) ?? {failures: 0, blockedUntil: 0};
++    entry.failures += 1;
++    if (entry.failures >= 5) {
++      entry.blockedUntil = now + 30_000;
++      entry.failures = 0;
++    }
++    this.entries.set(key, entry);
++    if (this.entries.size > 10_000) {
++      for (const [candidate, value] of this.entries) {
++        if (value.blockedUntil <= now) {
++          this.entries.delete(candidate);
++        }
++      }
++    }
++  }
++
++  /** @param {string} key */
++  reset(key) {
++    this.entries.delete(key);
++  }
++}
++
++export class GaiaService {
++  /**
++   * @param {object} options
++   * @param {import('./db.mjs').Store} options.store
++   * @param {import('./config.mjs').Config} options.config
++   * @param {ReturnType<import('./config.mjs').createLogger>} options.logger
++   */
++  constructor({store, config, logger}) {
++    this.store = store;
++    this.config = config;
++    this.logger = logger;
++    this.secret = store.getOrCreateSecret();
++    this.throttle = new LoginThrottle();
++  }
++
++  // ------------------------------------------------------------- helpers
++
++  /** @param {string} sid @param {string} name */
++  cookieValue(sid, name) {
++    return createHmac('sha256', this.secret)
++        .update(`gaia-cookie:${sid}:${name}`)
++        .digest('base64url')
++        .slice(0, 32);
++  }
++
++  /**
++   * @param {string} name
++   * @param {string} value
++   * @param {number} [maxAgeSeconds]
++   */
++  serializeCookie(name, value, maxAgeSeconds) {
++    const parts = [`${name}=${value}`, 'Path=/', 'HttpOnly', 'SameSite=Lax'];
++    if (maxAgeSeconds !== undefined) {
++      parts.push(`Max-Age=${Math.max(0, Math.floor(maxAgeSeconds))}`);
++    }
++    if (this.config.secureCookies) {
++      parts.push('Secure');
++    }
++    return parts.join('; ');
++  }
++
++  /** @param {string} sid */
++  buildAuthCookies(sid) {
++    const maxAge = this.config.sessionTtlDays * 86400;
++    return GAIA_COOKIE_NAMES.map((name) => {
++      const value = name === 'SID' ? sid : this.cookieValue(sid, name);
++      return this.serializeCookie(name, value, maxAge);
++    });
++  }
++
++  buildClearCookies() {
++    return GAIA_COOKIE_NAMES.map(
++        (name) => this.serializeCookie(name, '', 0),
++    );
++  }
++
++  /** @param {import('node:http').IncomingMessage} req */
++  sessionIdFromRequest(req) {
++    return parseCookieHeader(req.headers.cookie).get('SID') ?? null;
++  }
++
++  /**
++   * Returns the live session for the request, or null.
++   * @param {import('node:http').IncomingMessage} req
++   */
++  getSession(req) {
++    const sid = this.sessionIdFromRequest(req);
++    if (!sid) {
++      return null;
++    }
++    const session = this.store.getSession(sid);
++    if (!session) {
++      return null;
++    }
++    const now = Math.floor(Date.now() / 1000);
++    if (session.revoked_at || session.expires_at <= now) {
++      return null;
++    }
++    return session;
++  }
++
++  /**
++   * Returns `url` if it is a safe http(s) redirect target, else null.
++   * Gaia itself refuses chrome:// continue URLs, and Chromium stops using a
++   * non-Google continue URL in some flows, so anything that is not http(s) is
++   * dropped and the caller falls back to a local page.
++   * @param {string | null} raw
++   */
++  resolveContinue(raw) {
++    if (!raw) {
++      return null;
++    }
++    let url;
++    try {
++      url = new URL(raw);
++    } catch {
++      return null;
++    }
++    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
++      return null;
++    }
++    if (this.config.allowedContinueHosts.length > 0 &&
++        !this.config.allowedContinueHosts.includes(url.hostname)) {
++      return null;
++    }
++    return url.toString();
++  }
++
++  /** @param {import('node:http').IncomingMessage} req */
++  clientInfo(req) {
++    return {
++      ip: req.socket.remoteAddress ?? '',
++      userAgent: String(req.headers['user-agent'] ?? ''),
++    };
++  }
++
++  /**
++   * @param {object} options
++   * @param {import('./db.mjs').Store extends never ? never : any} options.user
++   * @param {string} options.authCode
++   * @param {number} options.position
++   */
++  buildDiceSigninHeader({user, authCode, position}) {
++    // Legacy (comma separated) format; Chromium also supports the grouped
++    // format for multiple accounts. Attributes are URL-escaped because
++    // DiceHeaderHelper::ParseGroup() unescapes them.
++    return [
++      'action=SIGNIN',
++      `authuser=${position}`,
++      `id=${encodeURIComponent(user.gaia_id)}`,
++      `email=${encodeURIComponent(user.display_email)}`,
++      `authorization_code=${encodeURIComponent(authCode)}`,
++    ].join(',');
++  }
++
++  /**
++   * @param {any} user
++   * @param {string} audience
++   */
++  buildIdToken(user, audience) {
++    const now = Math.floor(Date.now() / 1000);
++    return signJwt(this.secret, {
++      iss: this.config.publicUrl,
++      aud: audience || 'afree-login',
++      sub: user.gaia_id,
++      email: user.display_email,
++      email_verified: Boolean(user.email_verified),
++      name: user.display_name || user.display_email,
++      picture: user.avatar_url || undefined,
++      iat: now,
++      exp: now + this.config.accessTokenTtlSeconds,
++    });
++  }
++
++  /** @param {any} user */
++  userInfo(user) {
++    return {
++      id: user.gaia_id,
++      sub: user.gaia_id,
++      email: user.display_email,
++      verified_email: user.display_email,
++      email_verified: Boolean(user.email_verified),
++      name: user.display_name || user.display_email,
++      given_name: user.display_name || user.display_email,
++      picture: user.avatar_url || '',
++      locale: 'en',
++    };
++  }
++
++  /**
++   * Extracts the bearer token from an Authorization header.
++   * @param {import('node:http').IncomingMessage} req
++   */
++  bearerToken(req) {
++    const header = String(req.headers.authorization ?? '');
++    const match = /^(?:Bearer|OAuth)\s+(.+)$/i.exec(header);
++    return match ? match[1].trim() : null;
++  }
++
++  // -------------------------------------------------------------- routing
++
++  /**
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   */
++  async handle(req, res) {
++    const url = new URL(req.url ?? '/', 'http://localhost');
++    let path = url.pathname;
++    if (path.length > 1 && path.endsWith('/')) {
++      path = path.slice(0, -1);
++    }
++    const method = (req.method ?? 'GET').toUpperCase();
++
++    try {
++      // Sign-in pages.
++      if (method === 'GET' && SIGNIN_PATHS.has(path)) {
++        await this.handleSigninPage(req, res, url, path);
++        return;
++      }
++
++      if (method === 'POST' && SIGNIN_PATHS.has(path)) {
++        await this.handleSigninSubmit(req, res, url, path);
++        return;
++      }
++
++      if (path === '/enable_sync' && (method === 'GET' || method === 'POST')) {
++        await this.handleEnableSync(req, res);
++        return;
++      }
++
++      if (path === '/ListAccounts' && (method === 'GET' || method === 'POST')) {
++        await this.handleListAccounts(req, res);
++        return;
++      }
++
++      if (path === '/oauth2/v4/token' && (method === 'POST' || method === 'GET')) {
++        await this.handleTokenRequest(req, res, url);
++        return;
++      }
++
++      if (
++        (path === '/oauth2/v1/userinfo' || path === '/oauth2/v2/userinfo') &&
++        (method === 'GET' || method === 'POST')
++      ) {
++        await this.handleUserInfo(req, res, url);
++        return;
++      }
++
++      if (path === '/oauth2/v2/tokeninfo' && (method === 'GET' || method === 'POST')) {
++        await this.handleTokenInfo(req, res, url);
++        return;
++      }
++
++      if (path === '/oauth/multilogin' && method === 'POST') {
++        await this.handleMultilogin(req, res, url);
++        return;
++      }
++
++      if (path === '/GetCheckConnectionInfo') {
++        await readBody(req);
++        sendJson(res, 200, [], {'Cache-Control': 'no-store'});
++        return;
++      }
++
++      if (path === '/Logout' && (method === 'GET' || method === 'POST')) {
++        await this.handleLogout(req, res, url);
++        return;
++      }
++
++      if (path === '/o/oauth2/revoke' && (method === 'POST' || method === 'GET')) {
++        await this.handleRevoke(req, res, url);
++        return;
++      }
++
++      if (path === '/RotateBoundCookies') {
++        await readBody(req);
++        // DBSC (device bound session credentials) is not implemented.
++        sendJson(res, 400, {status: 'INVALID_INPUT'});
++        return;
++      }
++
++      if (path.startsWith('/reauth/v1beta/users/')) {
++        await readBody(req);
++        sendJson(res, 400, {error: {message: 'INVALID_GRANT'}});
++        return;
++      }
++
++      if (path === '/chrome/blank.html') {
++        await readBody(req);
++        sendText(res, 200, '', {'Cache-Control': 'no-store'});
++        return;
++      }
++
++      if (path === '/signup' && method === 'GET') {
++        await this.handleSignupPage(req, res, url);
++        return;
++      }
++
++      if (path === '/signup' && method === 'POST') {
++        await this.handleSignupSubmit(req, res, url);
++        return;
++      }
++
++      if (path === '/healthz') {
++        sendJson(res, 200, {status: 'ok'});
++        return;
++      }
++
++      if (path === '/favicon.ico') {
++        res.writeHead(204);
++        res.end();
++        return;
++      }
++
++      if (path === '/' && method === 'GET') {
++        sendHtml(
++            res,
++            200,
++            renderIndexPage({
++              publicUrl: this.config.publicUrl,
++              serviceName: 'afree',
++            }),
++        );
++        return;
++      }
++
++      await readBody(req);
++      sendHtml(
++          res,
++          404,
++          renderErrorPage({
++            status: 404,
++            title: 'Not found',
++            message: `${method} ${path} is not implemented by this service.`,
++          }),
++      );
++    } catch (error) {
++      const status = /** @type {any} */ (error)?.statusCode ?? 500;
++      this.logger.error('request failed', {
++        method,
++        path,
++        error: String(/** @type {any} */ (error)?.stack ?? error),
++      });
++      if (!res.headersSent) {
++        sendText(res, status, status === 413 ? 'payload too large' : 'internal error');
++      } else {
++        res.end();
++      }
++    }
++  }
++
++  // --------------------------------------------------------- sign-in flow
++
++  /**
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   * @param {URL} url
++   * @param {string} path
++   */
++  async handleSigninPage(req, res, url, path) {
++    const session = this.getSession(req);
++    let signedInEmail = '';
++    if (session) {
++      const primary = this.store.getUserById(session.primary_user_id);
++      signedInEmail = primary?.display_email ?? '';
++    }
++    sendHtml(
++        res,
++        200,
++        renderLoginPage({
++          email: url.searchParams.get('email_hint') ??
++              url.searchParams.get('email') ?? '',
++          continueUrl: url.searchParams.get('continue') ?? '',
++          flow: url.searchParams.get('flow') ?? '',
++          addAccount: path === '/AddSession' ||
++              url.searchParams.get('add') === '1',
++          signedInEmail,
++          allowRegistration: this.config.allowRegistration,
++          serviceName: 'afree',
++        }),
++        {'Cache-Control': 'no-store'},
++    );
++  }
++
++  /**
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   * @param {URL} url
++   * @param {string} path
++   */
++  async handleSigninSubmit(req, res, url, path) {
++    const form = new URLSearchParams(await readBody(req));
++    const email = String(form.get('email') ?? '').trim().slice(0, 254);
++    const password = String(form.get('password') ?? '').slice(0, MAX_PASSWORD_LENGTH);
++    const continueUrl =
++        form.get('continue') ?? url.searchParams.get('continue') ?? '';
++    const flow = form.get('flow') ?? url.searchParams.get('flow') ?? '';
++    const addAccount = form.get('add') === '1' || path === '/AddSession';
++    const {ip, userAgent} = this.clientInfo(req);
++
++    /** @type {(message: string, status: number) => void} */
++    const fail = (message, status) => {
++      sendHtml(
++          res,
++          status,
++          renderLoginPage({
++            email,
++            error: message,
++            continueUrl,
++            flow,
++            addAccount,
++            allowRegistration: this.config.allowRegistration,
++          }),
++          {'Cache-Control': 'no-store'},
++      );
++    };
++
++    const throttleKey = `${ip}|${canonicalizeEmail(email)}`;
++    const blockedFor = this.throttle.isBlocked(throttleKey);
++    if (blockedFor > 0) {
++      fail(
++          `尝试次数过多，请 ${blockedFor} 秒后重试 / Too many attempts, retry in ${blockedFor}s`,
++          429,
++      );
++      return;
++    }
++
++    if (!email || !password) {
++      fail('请输入邮箱和密码 / Email and password are required', 400);
++      return;
++    }
++
++    const user = this.store.getUserByEmail(email);
++    const passwordOk = verifyPassword(
++        password,
++        user ? user.password_hash : DUMMY_PASSWORD_HASH,
++    );
++
++    if (!user || !passwordOk) {
++      this.throttle.recordFailure(throttleKey);
++      this.store.audit({
++        userId: user?.id ?? null,
++        event: 'login_failed',
++        detail: user ? 'bad_password' : 'unknown_user',
++        ip,
++        userAgent,
++      });
++      fail('邮箱或密码不正确 / Wrong email or password', 401);
++      return;
++    }
++
++    if (user.disabled) {
++      this.store.audit({
++        userId: user.id,
++        event: 'login_failed',
++        detail: 'account_disabled',
++        ip,
++        userAgent,
++      });
++      fail('账号已被禁用 / This account is disabled', 403);
++      return;
++    }
++
++    this.throttle.reset(throttleKey);
++
++    const existingSession = this.getSession(req);
++    let sid;
++    let position = 0;
++    if (existingSession && addAccount) {
++      sid = existingSession.id;
++      position = this.store.addAccountToSession(existingSession.id, user.id);
++      this.store.touchSession(existingSession.id);
++    } else {
++      if (existingSession) {
++        this.store.revokeSession(existingSession.id);
++      }
++      sid = this.store.createSession(user.id, {
++        deviceId: String(form.get('device_id') ?? ''),
++        deviceName: String(form.get('device_name') ?? ''),
++        userAgent,
++        ip,
++        ttlSeconds: this.config.sessionTtlDays * 86400,
++      });
++    }
++
++    const authCode = this.store.createAuthCode({
++      userId: user.id,
++      clientId: String(form.get('client_id') ?? ''),
++      scope: OAUTH1_LOGIN_SCOPE,
++      ttlSeconds: this.config.authCodeTtlSeconds,
++    });
++
++    this.store.audit({
++      userId: user.id,
++      event: 'login_success',
++      detail: addAccount ? 'add_account' : 'signin',
++      ip,
++      userAgent,
++    });
++    this.logger.info('sign-in succeeded', {
++      email: user.display_email,
++      gaiaId: user.gaia_id,
++      position,
++      ip,
++    });
++
++    /** @type {string[]} */
++    const setCookies = this.buildAuthCookies(sid);
++    if (this.config.emitOAuthCodeCookie) {
++      // Legacy inline sign-in flow reads this cookie; the DICE flow uses the
++      // authorization_code attribute in the response header instead.
++      setCookies.push(this.serializeCookie('oauth_code', authCode, 60));
++    }
++
++    /** @type {Record<string, string | string[]>} */
++    const headers = {
++      'Cache-Control': 'no-store',
++      Pragma: 'no-cache',
++      'Set-Cookie': setCookies,
++      [DICE_HEADER]: this.buildDiceSigninHeader({user, authCode, position}),
++    };
++
++    const target = this.resolveContinue(continueUrl);
++    if (target && this.config.redirectContinue) {
++      redirect(res, target, headers);
++      return;
++    }
++
++    sendHtml(
++        res,
++        200,
++        renderSignedInPage({
++          email: user.display_email,
++          gaiaId: user.gaia_id,
++          continueUrl: target ?? '',
++        }),
++        headers,
++    );
++  }
++
++  // ----------------------------------------------------------- endpoints
++
++  /**
++   * Mirrors the /enable_sync endpoint used by Chromium's dice browsertest:
++   * it answers with action=ENABLE_SYNC so the client can finish the sync
++   * opt-in step.
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   */
++  async handleEnableSync(req, res) {
++    await readBody(req);
++    const session = this.getSession(req);
++    const user = session ? this.store.getUserById(session.primary_user_id) : null;
++    /** @type {Record<string, string>} */
++    const headers = {'Cache-Control': 'no-store'};
++    if (user) {
++      headers[DICE_HEADER] =
++          `action=ENABLE_SYNC,authuser=0,id=${encodeURIComponent(user.gaia_id)},` +
++          `email=${encodeURIComponent(user.display_email)}`;
++    }
++    sendText(res, 200, user ? 'sync enabled' : 'not signed in', headers);
++  }
++
++  /**
++   * Chromium POSTs to /ListAccounts with cookies and a single space body.
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   */
++  async handleListAccounts(req, res) {
++    await readBody(req);
++    const session = this.getSession(req);
++    /** @type {import('./proto.mjs').ListedAccount[]} */
++    const accounts = [];
++    if (session) {
++      for (const account of this.store.getSessionAccounts(session.id)) {
++        if (account.disabled) {
++          continue;
++        }
++        accounts.push({
++          displayEmail: account.display_email,
++          obfuscatedId: account.gaia_id,
++          validSession: true,
++          signedOut: false,
++          isVerified: Boolean(account.email_verified),
++        });
++      }
++      this.store.touchSession(session.id);
++    }
++    sendText(
++        res,
++        200,
++        encodeListAccountsResponseBase64(accounts),
++        {'Cache-Control': 'no-store'},
++    );
++  }
++
++  /**
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   * @param {URL} url
++   */
++  async handleTokenRequest(req, res, url) {
++    const body = await readBody(req);
++    const params = new URLSearchParams(body);
++    const grantType = params.get('grant_type') ??
++        url.searchParams.get('grant_type') ?? '';
++
++    const tokenError = (/** @type {string} */ error, description) => {
++      sendJson(
++          res,
++          400,
++          {error, ...(description ? {error_description: description} : {})},
++          {'Cache-Control': 'no-store'},
++      );
++    };
++
++    if (grantType === 'authorization_code') {
++      const code = params.get('code') ?? '';
++      if (!code) {
++        tokenError('invalid_request', 'missing code');
++        return;
++      }
++      const row = this.store.consumeAuthCode(code);
++      if (!row) {
++        tokenError('invalid_grant', 'authorization code is invalid or expired');
++        return;
++      }
++      const user = this.store.getUserById(row.user_id);
++      if (!user || user.disabled) {
++        tokenError('invalid_grant', 'account is not usable');
++        return;
++      }
++      const deviceId = params.get('device_id') ?? row.device_id ?? '';
++      const deviceType = params.get('device_type') ?? '';
++      if (deviceId && deviceType && deviceType !== 'chrome') {
++        tokenError('invalid_request', 'device_type must be chrome');
++        return;
++      }
++      const clientId = params.get('client_id') ?? row.client_id ?? '';
++      const scope = params.get('scope') ?? row.scope ?? '';
++      const refreshToken = this.store.createRefreshToken({
++        userId: user.id,
++        clientId,
++        scope,
++        deviceId,
++        ttlDays: this.config.refreshTokenTtlDays,
++      });
++      const accessToken = this.store.createAccessToken({
++        userId: user.id,
++        refreshTokenHash: sha256(refreshToken),
++        clientId,
++        scope,
++        ttlSeconds: this.config.accessTokenTtlSeconds,
++      });
++      this.store.audit({
++        userId: user.id,
++        event: 'token_issued',
++        detail: 'authorization_code',
++        ip: this.clientInfo(req).ip,
++        userAgent: this.clientInfo(req).userAgent,
++      });
++      sendJson(
++          res,
++          200,
++          {
++            access_token: accessToken,
++            refresh_token: refreshToken,
++            expires_in: this.config.accessTokenTtlSeconds,
++            token_type: 'Bearer',
++            id_token: this.buildIdToken(user, clientId),
++            scope,
++          },
++          {'Cache-Control': 'no-store'},
++      );
++      return;
++    }
++
++    if (grantType === 'refresh_token') {
++      const refreshToken = params.get('refresh_token') ?? '';
++      if (!refreshToken) {
++        tokenError('invalid_request', 'missing refresh_token');
++        return;
++      }
++      const row = this.store.getRefreshToken(refreshToken);
++      if (!row) {
++        tokenError('invalid_grant', 'refresh token is invalid or expired');
++        return;
++      }
++      const user = this.store.getUserById(row.user_id);
++      if (!user || user.disabled) {
++        tokenError('invalid_grant', 'account is not usable');
++        return;
++      }
++      // Chromium asks for one scope per service; the service does not restrict
++      // scopes, so the requested value is recorded on the issued token.
++      const scope = params.get('scope') ?? '';
++      const clientId = params.get('client_id') ?? row.client_id ?? '';
++      const accessToken = this.store.createAccessToken({
++        userId: user.id,
++        refreshTokenHash: row.token_hash,
++        clientId,
++        scope,
++        ttlSeconds: this.config.accessTokenTtlSeconds,
++      });
++      sendJson(
++          res,
++          200,
++          {
++            access_token: accessToken,
++            expires_in: this.config.accessTokenTtlSeconds,
++            token_type: 'Bearer',
++            id_token: this.buildIdToken(user, clientId),
++            scope,
++          },
++          {'Cache-Control': 'no-store'},
++      );
++      return;
++    }
++
++    tokenError(
++        'unsupported_grant_type',
++        `grant_type must be authorization_code or refresh_token, got "${
++            grantType}"`,
++    );
++  }
++
++  /**
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   * @param {URL} url
++   */
++  async handleUserInfo(req, res, url) {
++    const body = await readBody(req);
++    const params = new URLSearchParams(body);
++    const token = this.bearerToken(req) || params.get('access_token') ||
++        url.searchParams.get('access_token');
++    const row = token ? this.store.getAccessToken(token) : null;
++    const user = row ? this.store.getUserById(row.user_id) : null;
++    if (!user || user.disabled) {
++      sendJson(
++          res,
++          401,
++          {error: 'invalid_token'},
++          {'Cache-Control': 'no-store', 'WWW-Authenticate': 'Bearer'},
++      );
++      return;
++    }
++    sendJson(res, 200, this.userInfo(user), {'Cache-Control': 'no-store'});
++  }
++
++  /**
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   * @param {URL} url
++   */
++  async handleTokenInfo(req, res, url) {
++    const body = await readBody(req);
++    const params = new URLSearchParams(body);
++    const token = params.get('access_token') ??
++        url.searchParams.get('access_token') ?? this.bearerToken(req);
++    const row = token ? this.store.getAccessToken(token) : null;
++    const user = row ? this.store.getUserById(row.user_id) : null;
++    if (!user) {
++      sendJson(res, 400, {error: 'invalid_token'}, {'Cache-Control': 'no-store'});
++      return;
++    }
++    sendJson(
++        res,
++        200,
++        {
++          issued_to: row.client_id || 'afree',
++          audience: row.client_id || 'afree',
++          user_id: user.gaia_id,
++          scope: row.scope,
++          expires_in: Math.max(0, row.expires_at - Math.floor(Date.now() / 1000)),
++          email: user.display_email,
++          verified_email: user.display_email,
++          id_token: this.buildIdToken(user, row.client_id),
++        },
++        {'Cache-Control': 'no-store'},
++    );
++  }
++
++  /**
++   * Sets the GAIA cookies for the accounts Chromium just signed in.
++   * Chromium sends `Authorization: MultiBearer <token>:<gaia id>,...` and
++   * `?source=chrome&reuseCookies=...`.
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   * @param {URL} url
++   */
++  async handleMultilogin(req, res, url) {
++    await readBody(req);
++    const header = String(req.headers.authorization ?? '');
++    const multiBearer = /^MultiBearer\s+(.+)$/i.exec(header);
++    if (!multiBearer) {
++      sendXssiJson(
++          res,
++          400,
++          {
++            status: 'INVALID_INPUT',
++            message: 'Authorization must be MultiBearer <token>:<gaia_id>',
++          },
++          {'Cache-Control': 'no-store'},
++      );
++      return;
++    }
++
++    /** @type {{token: string, gaiaId: string}[]} */
++    const credentials = [];
++    for (const part of multiBearer[1].split(',')) {
++      const trimmed = part.trim();
++      if (!trimmed) {
++        continue;
++      }
++      // Access tokens are base64url, so the last ':' separates the gaia id.
++      const index = trimmed.lastIndexOf(':');
++      if (index <= 0) {
++        sendXssiJson(
++            res,
++            400,
++            {status: 'INVALID_INPUT', message: 'malformed credentials'},
++            {'Cache-Control': 'no-store'},
++        );
++        return;
++      }
++      credentials.push({
++        token: trimmed.slice(0, index),
++        gaiaId: trimmed.slice(index + 1),
++      });
++    }
++
++    if (credentials.length === 0) {
++      sendXssiJson(
++          res,
++          400,
++          {status: 'INVALID_INPUT', message: 'no credentials'},
++          {'Cache-Control': 'no-store'},
++      );
++      return;
++    }
++
++    /** @type {{status: string, gaia_id: string}[]} */
++    const failedAccounts = [];
++    /** @type {Set<string>} */
++    const userIds = new Set();
++    for (const credential of credentials) {
++      const row = this.store.getAccessToken(credential.token);
++      const user = row ? this.store.getUserById(row.user_id) : null;
++      if (!user || user.disabled || user.gaia_id !== credential.gaiaId) {
++        failedAccounts.push({status: 'RECOVERABLE', gaia_id: credential.gaiaId});
++        continue;
++      }
++      userIds.add(user.id);
++    }
++
++    if (failedAccounts.length > 0) {
++      sendXssiJson(
++          res,
++          400,
++          {status: 'INVALID_TOKENS', failed_accounts: failedAccounts},
++          {'Cache-Control': 'no-store'},
++      );
++      return;
++    }
++
++    // Prefer the account whose session is attached to this request, so the
++    // cookie values stay consistent with /ListAccounts.
++    const session = this.getSession(req);
++    /** @type {any} */
++    let primaryUser = null;
++    if (session) {
++      const primary = this.store.getUserById(session.primary_user_id);
++      if (primary && userIds.has(primary.id)) {
++        primaryUser = primary;
++      }
++    }
++    if (!primaryUser) {
++      primaryUser = this.store.getUserById([...userIds][0]);
++    }
++    if (!primaryUser) {
++      sendXssiJson(
++          res,
++          400,
++          {status: 'INVALID_TOKENS', failed_accounts: failedAccounts},
++          {'Cache-Control': 'no-store'},
++      );
++      return;
++    }
++
++    const sid = session?.id ?? this.store.createSession(primaryUser.id, {
++      userAgent: this.clientInfo(req).userAgent,
++      ip: this.clientInfo(req).ip,
++      ttlSeconds: this.config.sessionTtlDays * 86400,
++    });
++
++    const maxAge = 2 * 365 * 86400;
++    const cookies = GAIA_COOKIE_NAMES.map((name) => ({
++      name,
++      value: name === 'SID' ? sid : this.cookieValue(sid, name),
++      // `host` (instead of `domain`) yields a host-only cookie, which is what
++      // an IP or single-label test host needs.
++      host: this.config.cookieHost,
++      path: '/',
++      isSecure: this.config.secureCookies,
++      isHttpOnly: true,
++      maxAge,
++      priority: 'HIGH',
++    }));
++
++    sendXssiJson(
++        res,
++        200,
++        {status: 'OK', cookies},
++        {'Cache-Control': 'no-store'},
++    );
++
++    this.logger.debug('multilogin', {
++      source: url.searchParams.get('source') ?? '',
++      accounts: userIds.size,
++    });
++  }
++
++  /**
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   * @param {URL} url
++   */
++  async handleLogout(req, res, url) {
++    await readBody(req);
++    const session = this.getSession(req);
++    /** @type {Record<string, string | string[]>} */
++    const headers = {
++      'Cache-Control': 'no-store',
++      'Set-Cookie': this.buildClearCookies(),
++    };
++
++    if (session) {
++      const primary = this.store.getUserById(session.primary_user_id);
++      if (primary) {
++        headers[SIGNOUT_HEADER] = `email="${
++            primary.display_email}", obfuscatedid="${primary.gaia_id}", sessionindex=0`;
++      }
++      this.store.revokeSession(session.id);
++      this.store.audit({
++        userId: session.primary_user_id,
++        event: 'logout',
++        ip: this.clientInfo(req).ip,
++        userAgent: this.clientInfo(req).userAgent,
++      });
++    }
++
++    const target = this.resolveContinue(url.searchParams.get('continue'));
++    if (target && this.config.redirectContinue) {
++      redirect(res, target, headers);
++      return;
++    }
++    sendHtml(res, 200, renderSignedOutPage({continueUrl: target ?? ''}), headers);
++  }
++
++  /**
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   * @param {URL} url
++   */
++  async handleRevoke(req, res, url) {
++    const body = await readBody(req);
++    const params = new URLSearchParams(body);
++    const token = params.get('token') ?? url.searchParams.get('token') ?? '';
++    if (!token) {
++      sendJson(res, 400, {error: 'invalid_request'}, {'Cache-Control': 'no-store'});
++      return;
++    }
++    this.store.revokeRefreshToken(token);
++    sendText(res, 200, '', {'Cache-Control': 'no-store'});
++  }
++
++  // ------------------------------------------------------------- signup
++
++  /**
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   * @param {URL} url
++   */
++  async handleSignupPage(req, res, url) {
++    if (!this.config.allowRegistration) {
++      sendHtml(
++          res,
++          404,
++          renderErrorPage({
++            status: 404,
++            title: 'Registration disabled',
++            message: 'Start the service with --allow-registration to enable it.',
++          }),
++      );
++      return;
++    }
++    sendHtml(
++        res,
++        200,
++        renderSignupPage({
++          continueUrl: url.searchParams.get('continue') ?? '',
++        }),
++        {'Cache-Control': 'no-store'},
++    );
++  }
++
++  /**
++   * @param {import('node:http').IncomingMessage} req
++   * @param {import('node:http').ServerResponse} res
++   * @param {URL} url
++   */
++  async handleSignupSubmit(req, res, url) {
++    if (!this.config.allowRegistration) {
++      sendText(res, 404, 'registration disabled');
++      return;
++    }
++    const form = new URLSearchParams(await readBody(req));
++    const email = String(form.get('email') ?? '').trim().slice(0, 254);
++    const password = String(form.get('password') ?? '');
++    if (!email || password.length < 8) {
++      sendHtml(
++          res,
++          400,
++          renderErrorPage({
++            status: 400,
++            title: 'Invalid input',
++            message: 'A valid email and a password of at least 8 characters are required.',
++          }),
++      );
++      return;
++    }
++    if (this.store.getUserByEmail(email)) {
++      sendHtml(
++          res,
++          409,
++          renderErrorPage({
++            status: 409,
++            title: 'Account exists',
++            message: 'An account with this email already exists.',
++          }),
++      );
++      return;
++    }
++    const user = this.store.createUser({email, password});
++    this.store.audit({
++      userId: user.id,
++      event: 'user_created',
++      detail: 'signup',
++      ip: this.clientInfo(req).ip,
++      userAgent: this.clientInfo(req).userAgent,
++    });
++    redirect(res, '/signin/chrome/sync', {'Cache-Control': 'no-store'});
++  }
++}
++
++/**
++ * @param {object} options
++ * @param {import('./db.mjs').Store} options.store
++ * @param {import('./config.mjs').Config} options.config
++ * @param {ReturnType<import('./config.mjs').createLogger>} options.logger
++ */
++export function createGaiaService({store, config, logger}) {
++  const service = new GaiaService({store, config, logger});
++  return {
++    /** @param {import('node:http').IncomingMessage} req @param {import('node:http').ServerResponse} res */
++    handle: (req, res) => service.handle(req, res),
++    service,
++  };
++}
+diff --git a/tools/afree-login-service/src/proto.mjs b/tools/afree-login-service/src/proto.mjs
+new file mode 100644
+index 0000000000..2b64582aaf
+--- /dev/null
++++ b/tools/afree-login-service/src/proto.mjs
+@@ -0,0 +1,223 @@
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Minimal protobuf wire-format support for the GAIA endpoints that use
++// protobuf.
++//
++// Chromium only speaks protobuf over the wire on this call path for two
++// endpoints:
++//
++//   /ListAccounts  -> gaia.ListAccountsResponse
++//                     (google_apis/gaia/list_accounts_response.proto)
++//   /oauth2/v2/tokeninfo and the rest are JSON.
++//
++// Chromium base64-decodes the /ListAccounts body and parses it with
++// `ListAccountsResponse::ParseFromString()`, see
++// `ParseBinaryListAccountsData()` in google_apis/gaia/gaia_auth_util.cc.
++//
++// Implementing the 30 lines of wire format needed here is simpler and more
++// robust than depending on a protobuf runtime plus a codegen step. The
++// encoder below mirrors `CreateListAccountsResponseInBinaryFormat()` in
++// google_apis/gaia/gaia_auth_test_util.cc, which is what Chromium's own
++// FakeGaia returns.
++
++const WIRE_VARINT = 0;
++const WIRE_LENGTH_DELIMITED = 2;
++
++// Field numbers from google_apis/gaia/list_accounts_response.proto.
++const LIST_ACCOUNTS_ACCOUNT = 1;
++const ACCOUNT_DISPLAY_EMAIL = 3;
++const ACCOUNT_VALID_SESSION = 9;
++const ACCOUNT_OBFUSCATED_ID = 10;
++const ACCOUNT_SIGNED_OUT = 14;
++const ACCOUNT_IS_VERIFIED = 15;
++
++/**
++ * Encodes a non-negative safe integer as a protobuf varint.
++ * @param {number} value
++ * @returns {Buffer}
++ */
++function encodeVarint(value) {
++  if (!Number.isSafeInteger(value) || value < 0) {
++    throw new RangeError(`invalid varint value: ${value}`);
++  }
++  const bytes = [];
++  let remaining = value;
++  while (remaining >= 0x80) {
++    bytes.push((remaining & 0x7f) | 0x80);
++    remaining = Math.floor(remaining / 0x80);
++  }
++  bytes.push(remaining);
++  return Buffer.from(bytes);
++}
++
++function makeTag(fieldNumber, wireType) {
++  return encodeVarint((fieldNumber << 3) | wireType);
++}
++
++function encodeStringField(fieldNumber, value) {
++  const data = Buffer.from(value, 'utf8');
++  return Buffer.concat([
++    makeTag(fieldNumber, WIRE_LENGTH_DELIMITED),
++    encodeVarint(data.length),
++    data,
++  ]);
++}
++
++function encodeBoolField(fieldNumber, value) {
++  return Buffer.concat([
++    makeTag(fieldNumber, WIRE_VARINT),
++    encodeVarint(value ? 1 : 0),
++  ]);
++}
++
++/**
++ * @typedef {object} ListedAccount
++ * @property {string} displayEmail
++ * @property {string} obfuscatedId
++ * @property {boolean} [validSession]
++ * @property {boolean} [signedOut]
++ * @property {boolean} [isVerified]
++ */
++
++/**
++ * Serializes a `gaia.ListAccountsResponse` message.
++ * @param {ListedAccount[]} accounts
++ * @returns {Buffer}
++ */
++export function encodeListAccountsResponse(accounts) {
++  const parts = [];
++  for (const account of accounts) {
++    const message = Buffer.concat([
++      encodeStringField(ACCOUNT_DISPLAY_EMAIL, account.displayEmail),
++      encodeBoolField(
++        ACCOUNT_VALID_SESSION,
++        account.validSession !== false,
++      ),
++      encodeStringField(ACCOUNT_OBFUSCATED_ID, account.obfuscatedId),
++      encodeBoolField(ACCOUNT_SIGNED_OUT, account.signedOut === true),
++      encodeBoolField(ACCOUNT_IS_VERIFIED, account.isVerified !== false),
++    ]);
++    parts.push(
++      makeTag(LIST_ACCOUNTS_ACCOUNT, WIRE_LENGTH_DELIMITED),
++      encodeVarint(message.length),
++      message,
++    );
++  }
++  return Buffer.concat(parts);
++}
++
++/**
++ * Serializes and base64-encodes a `gaia.ListAccountsResponse`, exactly the
++ * format `base::Base64Encode()` produces on the Chromium side.
++ * @param {ListedAccount[]} accounts
++ * @returns {string}
++ */
++export function encodeListAccountsResponseBase64(accounts) {
++  return encodeListAccountsResponse(accounts).toString('base64');
++}
++
++function readVarint(buffer, offset) {
++  let result = 0;
++  let shift = 0;
++  let index = offset;
++  for (;;) {
++    if (index >= buffer.length) {
++      throw new RangeError('truncated varint');
++    }
++    const byte = buffer[index++];
++    result += (byte & 0x7f) * 2 ** shift;
++    if ((byte & 0x80) === 0) {
++      return [result, index];
++    }
++    shift += 7;
++    if (shift > 63) {
++      throw new RangeError('varint too long');
++    }
++  }
++}
++
++function* iterFields(buffer) {
++  let offset = 0;
++  while (offset < buffer.length) {
++    let tag;
++    [tag, offset] = readVarint(buffer, offset);
++    const fieldNumber = Math.floor(tag / 8);
++    const wireType = tag & 0x7;
++    if (wireType === WIRE_VARINT) {
++      let value;
++      [value, offset] = readVarint(buffer, offset);
++      yield {fieldNumber, wireType, value};
++    } else if (wireType === WIRE_LENGTH_DELIMITED) {
++      let length;
++      [length, offset] = readVarint(buffer, offset);
++      if (offset + length > buffer.length) {
++        throw new RangeError('truncated length-delimited field');
++      }
++      yield {
++        fieldNumber,
++        wireType,
++        value: buffer.subarray(offset, offset + length),
++      };
++      offset += length;
++    } else if (wireType === 5) {
++      offset += 4;
++    } else if (wireType === 1) {
++      offset += 8;
++    } else {
++      throw new RangeError(`unsupported wire type ${wireType}`);
++    }
++  }
++}
++
++/**
++ * Decodes a `gaia.ListAccountsResponse`. Only used by tests and the CLI.
++ * @param {Buffer} buffer
++ * @returns {ListedAccount[]}
++ */
++export function decodeListAccountsResponse(buffer) {
++  const accounts = [];
++  for (const field of iterFields(buffer)) {
++    if (
++      field.fieldNumber !== LIST_ACCOUNTS_ACCOUNT ||
++      field.wireType !== WIRE_LENGTH_DELIMITED
++    ) {
++      continue;
++    }
++    /** @type {ListedAccount} */
++    const account = {displayEmail: '', obfuscatedId: ''};
++    for (const sub of iterFields(field.value)) {
++      switch (sub.fieldNumber) {
++        case ACCOUNT_DISPLAY_EMAIL:
++          account.displayEmail = sub.value.toString('utf8');
++          break;
++        case ACCOUNT_OBFUSCATED_ID:
++          account.obfuscatedId = sub.value.toString('utf8');
++          break;
++        case ACCOUNT_VALID_SESSION:
++          account.validSession = sub.value !== 0;
++          break;
++        case ACCOUNT_SIGNED_OUT:
++          account.signedOut = sub.value !== 0;
++          break;
++        case ACCOUNT_IS_VERIFIED:
++          account.isVerified = sub.value !== 0;
++          break;
++        default:
++          break;
++      }
++    }
++    accounts.push(account);
++  }
++  return accounts;
++}
++
++/**
++ * Decodes the base64 payload Chromium returns/expects on /ListAccounts.
++ * @param {string} base64
++ * @returns {ListedAccount[]}
++ */
++export function decodeListAccountsResponseBase64(base64) {
++  return decodeListAccountsResponse(Buffer.from(base64, 'base64'));
++}
+diff --git a/tools/afree-login-service/src/schema.sql b/tools/afree-login-service/src/schema.sql
+new file mode 100644
+index 0000000000..a1173367c5
+--- /dev/null
++++ b/tools/afree-login-service/src/schema.sql
+@@ -0,0 +1,114 @@
++-- Copyright 2026 The afree Authors
++-- Use of this source code is governed by a BSD-style license that can be
++-- found in the LICENSE file.
++--
++-- SQLite schema for the afree sign-in service.
++--
++-- Design notes:
++--  * Every credential is stored as a SHA-256 hash. The plaintext token only
++--    ever exists in the HTTP response that hands it to the client.
++--  * Sessions model the GAIA "SID" cookie. A session can hold several
++--    accounts, mirroring the GAIA multi-account cookie jar.
++--  * All timestamps are Unix epoch seconds.
++
++CREATE TABLE IF NOT EXISTS meta (
++  key   TEXT PRIMARY KEY,
++  value TEXT NOT NULL
++) STRICT;
++
++CREATE TABLE IF NOT EXISTS users (
++  id             TEXT PRIMARY KEY,
++  -- Canonical (lowercased) email. Unique login identifier.
++  email          TEXT NOT NULL UNIQUE,
++  -- Email as typed by the user, returned by /ListAccounts and /userinfo.
++  display_email  TEXT NOT NULL,
++  password_hash  TEXT NOT NULL,
++  -- Opaque Gaia-style account id. Must never contain '@'.
++  gaia_id        TEXT NOT NULL UNIQUE,
++  display_name   TEXT NOT NULL DEFAULT '',
++  avatar_url     TEXT NOT NULL DEFAULT '',
++  email_verified INTEGER NOT NULL DEFAULT 1,
++  disabled       INTEGER NOT NULL DEFAULT 0,
++  created_at     INTEGER NOT NULL,
++  updated_at     INTEGER NOT NULL
++) STRICT;
++
++CREATE TABLE IF NOT EXISTS sessions (
++  id             TEXT PRIMARY KEY,
++  primary_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++  device_id      TEXT NOT NULL DEFAULT '',
++  device_name    TEXT NOT NULL DEFAULT '',
++  user_agent     TEXT NOT NULL DEFAULT '',
++  ip             TEXT NOT NULL DEFAULT '',
++  created_at     INTEGER NOT NULL,
++  last_seen_at   INTEGER NOT NULL,
++  expires_at     INTEGER NOT NULL,
++  revoked_at     INTEGER
++) STRICT;
++
++CREATE TABLE IF NOT EXISTS session_accounts (
++  session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
++  user_id    TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++  -- 0 is the primary account; also reported as `authuser` in the DICE header.
++  position   INTEGER NOT NULL,
++  added_at   INTEGER NOT NULL,
++  PRIMARY KEY (session_id, user_id)
++) STRICT;
++
++CREATE INDEX IF NOT EXISTS session_accounts_by_position
++  ON session_accounts(session_id, position);
++
++CREATE TABLE IF NOT EXISTS auth_codes (
++  code_hash    TEXT PRIMARY KEY,
++  user_id      TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++  client_id    TEXT NOT NULL DEFAULT '',
++  redirect_uri TEXT NOT NULL DEFAULT '',
++  scope        TEXT NOT NULL DEFAULT '',
++  device_id    TEXT NOT NULL DEFAULT '',
++  created_at   INTEGER NOT NULL,
++  expires_at   INTEGER NOT NULL,
++  used_at      INTEGER
++) STRICT;
++
++CREATE TABLE IF NOT EXISTS refresh_tokens (
++  token_hash    TEXT PRIMARY KEY,
++  user_id       TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++  client_id     TEXT NOT NULL DEFAULT '',
++  scope         TEXT NOT NULL DEFAULT '',
++  device_id     TEXT NOT NULL DEFAULT '',
++  device_name   TEXT NOT NULL DEFAULT '',
++  created_at    INTEGER NOT NULL,
++  last_used_at  INTEGER,
++  -- NULL means "no expiry".
++  expires_at    INTEGER,
++  revoked_at    INTEGER
++) STRICT;
++
++CREATE INDEX IF NOT EXISTS refresh_tokens_by_user
++  ON refresh_tokens(user_id);
++
++CREATE TABLE IF NOT EXISTS access_tokens (
++  token_hash         TEXT PRIMARY KEY,
++  user_id            TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
++  refresh_token_hash TEXT,
++  client_id          TEXT NOT NULL DEFAULT '',
++  scope              TEXT NOT NULL DEFAULT '',
++  created_at         INTEGER NOT NULL,
++  expires_at         INTEGER NOT NULL,
++  revoked_at         INTEGER
++) STRICT;
++
++CREATE INDEX IF NOT EXISTS access_tokens_by_user
++  ON access_tokens(user_id);
++
++CREATE TABLE IF NOT EXISTS audit_log (
++  id         INTEGER PRIMARY KEY AUTOINCREMENT,
++  user_id    TEXT,
++  event      TEXT NOT NULL,
++  detail     TEXT NOT NULL DEFAULT '',
++  ip         TEXT NOT NULL DEFAULT '',
++  user_agent TEXT NOT NULL DEFAULT '',
++  created_at INTEGER NOT NULL
++) STRICT;
++
++CREATE INDEX IF NOT EXISTS audit_log_by_time ON audit_log(created_at);
+diff --git a/tools/afree-login-service/src/server.mjs b/tools/afree-login-service/src/server.mjs
+new file mode 100644
+index 0000000000..6b918f440d
+--- /dev/null
++++ b/tools/afree-login-service/src/server.mjs
+@@ -0,0 +1,109 @@
++#!/usr/bin/env node
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++import http from 'node:http';
++import {pathToFileURL} from 'node:url';
++import {createLogger, isLoopbackHost, loadConfig, USAGE} from './config.mjs';
++import {Store} from './db.mjs';
++import {createGaiaService} from './gaia.mjs';
++
++/**
++ * Builds the HTTP server without starting it. Used by tests and by the CLI.
++ * @param {object} options
++ * @param {Store} options.store
++ * @param {import('./config.mjs').Config} options.config
++ * @param {ReturnType<createLogger>} options.logger
++ */
++export function createHttpServer({store, config, logger}) {
++  const {handle, service} = createGaiaService({store, config, logger});
++  const server = http.createServer((req, res) => {
++    handle(req, res).catch((error) => {
++      logger.error('unhandled request error', {
++        error: String(error?.stack ?? error),
++      });
++      if (!res.headersSent) {
++        res.writeHead(500, {'Content-Type': 'text/plain; charset=utf-8'});
++      }
++      res.end('internal error');
++    });
++  });
++  return {server, service};
++}
++
++export async function startServer(config, logger) {
++  const store = Store.open(config.dbPath);
++  const {server} = createHttpServer({store, config, logger});
++
++  await new Promise((resolve, reject) => {
++    server.once('error', reject);
++    server.listen(config.port, config.host, resolve);
++  });
++
++  return {server, store};
++}
++
++async function main() {
++  const argv = process.argv.slice(2);
++  if (argv.includes('--help') || argv.includes('-h')) {
++    process.stdout.write(USAGE);
++    return;
++  }
++
++  const config = loadConfig(argv);
++  const logger = createLogger(config.logLevel);
++
++  if (!config.secureCookies) {
++    const loopback =
++        isLoopbackHost(new URL(config.publicUrl).hostname);
++    if (!loopback) {
++      logger.warn(
++          'serving over plain HTTP on a non-loopback host; cookies will not ' +
++          'be marked Secure. Use --public-url with an https:// origin and a ' +
++          'TLS terminator in production.');
++    }
++  }
++
++  const {server, store} = await startServer(config, logger);
++  const address = server.address();
++  const actualPort =
++      typeof address === 'object' && address ? address.port : config.port;
++
++  logger.info('afree login service listening', {
++    url: config.publicUrl,
++    address: `${config.host}:${actualPort}`,
++    database: config.dbPath,
++  });
++
++  process.stdout.write(`afree login service listening on ${config.publicUrl}
++database: ${config.dbPath}
++
++Next steps:
++  1) create a user:
++       node src/cli.mjs add-user --email you@example.com
++  2) write a Chromium gaia config:
++       node src/cli.mjs gen-gaia-config --url ${config.publicUrl} > gaia-config.json
++  3) start the client with:
++       --gaia-config=$PWD/gaia-config.json
++       --oauth2-client-id=afree-client-id --oauth2-client-secret=afree-client-secret
++`);
++
++  const shutdown = async (signal) => {
++    logger.info('shutting down', {signal});
++    await new Promise((resolve) => server.close(resolve));
++    store.close();
++    process.exit(0);
++  };
++  process.once('SIGINT', () => void shutdown('SIGINT'));
++  process.once('SIGTERM', () => void shutdown('SIGTERM'));
++}
++
++const invokedDirectly = process.argv[1] &&
++    import.meta.url === pathToFileURL(process.argv[1]).href;
++if (invokedDirectly) {
++  main().catch((error) => {
++    process.stderr.write(`afree login service failed: ${error?.message ?? error}\n`);
++    process.exit(1);
++  });
++}
+diff --git a/tools/afree-login-service/src/views.mjs b/tools/afree-login-service/src/views.mjs
+new file mode 100644
+index 0000000000..e7a9c8701b
+--- /dev/null
++++ b/tools/afree-login-service/src/views.mjs
+@@ -0,0 +1,343 @@
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// Server-rendered pages for the Gaia-compatible sign-in service. These are
++// intentionally dependency-free and small; Chromium only needs a form that
++// eventually redirects back with the X-Chrome-ID-Consistency-Response header.
++
++/** @param {unknown} value */
++function escapeHtml(value) {
++  return String(value ?? '')
++      .replaceAll('&', '&amp;')
++      .replaceAll('<', '&lt;')
++      .replaceAll('>', '&gt;')
++      .replaceAll('"', '&quot;')
++      .replaceAll("'", '&#39;');
++}
++
++const STYLE = `
++  :root {
++    color-scheme: light dark;
++    --bg: #f6f7f9;
++    --card: #ffffff;
++    --text: #202124;
++    --muted: #5f6368;
++    --line: #dadce0;
++    --accent: #1a73e8;
++    --error-bg: #fce8e6;
++    --error-text: #b3261e;
++  }
++  @media (prefers-color-scheme: dark) {
++    :root {
++      --bg: #202124;
++      --card: #2d2e31;
++      --text: #e8eaed;
++      --muted: #9aa0a6;
++      --line: #5f6368;
++      --accent: #8ab4f8;
++      --error-bg: #4a1f1c;
++      --error-text: #f6aea9;
++    }
++  }
++  * { box-sizing: border-box; }
++  body {
++    margin: 0;
++    min-height: 100vh;
++    display: flex;
++    align-items: center;
++    justify-content: center;
++    padding: 24px;
++    background: var(--bg);
++    color: var(--text);
++    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto,
++          "Noto Sans SC", sans-serif;
++  }
++  main {
++    width: 100%;
++    max-width: 400px;
++    background: var(--card);
++    border: 1px solid var(--line);
++    border-radius: 16px;
++    padding: 32px 28px 24px;
++    box-shadow: 0 1px 2px rgba(0, 0, 0, .08);
++  }
++  h1 { margin: 0 0 4px; font-size: 22px; font-weight: 500; }
++  .subtitle { margin: 0 0 24px; color: var(--muted); font-size: 13px; }
++  label { display: block; margin-bottom: 16px; }
++  label span { display: block; margin-bottom: 6px; font-size: 13px; color: var(--muted); }
++  input[type=email], input[type=password], input[type=text] {
++    width: 100%;
++    padding: 11px 12px;
++    border: 1px solid var(--line);
++    border-radius: 8px;
++    background: transparent;
++    color: var(--text);
++    font-size: 15px;
++  }
++  input:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
++  button {
++    width: 100%;
++    margin-top: 8px;
++    padding: 11px 16px;
++    border: 0;
++    border-radius: 999px;
++    background: var(--accent);
++    color: #fff;
++    font-size: 15px;
++    font-weight: 500;
++    cursor: pointer;
++  }
++  button:hover { filter: brightness(1.06); }
++  .error {
++    margin: 0 0 18px;
++    padding: 10px 12px;
++    border-radius: 8px;
++    background: var(--error-bg);
++    color: var(--error-text);
++    font-size: 13px;
++  }
++  .notice {
++    margin: 0 0 18px;
++    padding: 10px 12px;
++    border-radius: 8px;
++    background: rgba(26, 115, 232, .1);
++    color: var(--text);
++    font-size: 13px;
++  }
++  .hint { margin: 18px 0 0; color: var(--muted); font-size: 12px; word-break: break-all; }
++  .actions { margin-top: 20px; display: flex; gap: 12px; }
++  .actions a {
++    flex: 1;
++    text-align: center;
++    padding: 10px 14px;
++    border-radius: 999px;
++    border: 1px solid var(--line);
++    color: var(--text);
++    text-decoration: none;
++  }
++  .actions a.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
++  dl { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; font-size: 13px; }
++  dt { color: var(--muted); }
++  dd { margin: 0; word-break: break-all; }
++  ul.endpoints { padding-left: 18px; font-size: 13px; color: var(--muted); }
++  ul.endpoints code { color: var(--text); }
++`;
++
++/**
++ * @param {object} options
++ * @param {string} options.title
++ * @param {string} options.body
++ * @param {string} [options.lang]
++ */
++function layout({title, body, lang = 'zh-CN'}) {
++  return `<!doctype html>
++<html lang="${escapeHtml(lang)}">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<meta name="referrer" content="no-referrer">
++<title>${escapeHtml(title)}</title>
++<style>${STYLE}</style>
++</head>
++<body>
++<main>
++${body}
++</main>
++</body>
++</html>
++`;
++}
++
++/**
++ * @param {object} options
++ * @param {string} options.email
++ * @param {string} [options.error]
++ * @param {string} [options.continueUrl]
++ * @param {boolean} [options.addAccount]
++ * @param {string} [options.signedInEmail]
++ * @param {boolean} [options.allowRegistration]
++ * @param {string} [options.flow]
++ * @param {string} [options.serviceName]
++ */
++export function renderLoginPage({
++  email = '',
++  error = '',
++  continueUrl = '',
++  addAccount = false,
++  signedInEmail = '',
++  allowRegistration = false,
++  flow = '',
++  serviceName = 'afree',
++}) {
++  const notice = signedInEmail ?
++      `<p class="notice">此浏览器已登录 ${escapeHtml(signedInEmail)}，继续登录会切换主账号。<br>
++       Signed in as ${escapeHtml(signedInEmail)}; signing in again switches the
++       primary account.</p>` :
++      '';
++  const errorBlock = error ?
++      `<p class="error">${escapeHtml(error)}</p>` :
++      '';
++  const registerLink = allowRegistration ?
++      `<p class="hint">还没有账号？<a href="/signup">注册 afree 账号</a></p>` :
++      '';
++  return layout({
++    title: `登录 ${serviceName}`,
++    body: `<h1>登录 ${escapeHtml(serviceName)}</h1>
++<p class="subtitle">Sign in with your ${escapeHtml(serviceName)} account</p>
++${errorBlock}
++${notice}
++<form method="post" action="" autocomplete="on">
++  <input type="hidden" name="continue" value="${escapeHtml(continueUrl)}">
++  <input type="hidden" name="flow" value="${escapeHtml(flow)}">
++  <input type="hidden" name="add" value="${addAccount ? '1' : '0'}">
++  <label>
++    <span>邮箱 / Email</span>
++    <input type="email" name="email" value="${escapeHtml(email)}"
++           autocomplete="username" required autofocus>
++  </label>
++  <label>
++    <span>密码 / Password</span>
++    <input type="password" name="password" autocomplete="current-password"
++           required>
++  </label>
++  <button type="submit">登录 / Sign in</button>
++</form>
++${registerLink}
++<p class="hint">这是自建的 ${escapeHtml(serviceName)} 登录服务，不是 Google。
++This is a self-hosted ${escapeHtml(serviceName)} sign-in service, not Google.</p>`,
++  });
++}
++
++/**
++ * @param {object} options
++ * @param {string} options.email
++ * @param {string} options.gaiaId
++ * @param {string} [options.continueUrl]
++ * @param {string} [options.serviceName]
++ */
++export function renderSignedInPage({
++  email,
++  gaiaId,
++  continueUrl = '',
++  serviceName = 'afree',
++}) {
++  const continueLink = continueUrl ?
++      `<div class="actions">
++         <a class="primary" href="${escapeHtml(continueUrl)}">继续 / Continue</a>
++       </div>` :
++      '';
++  return layout({
++    title: `已登录 ${serviceName}`,
++    body: `<h1>已登录 / Signed in</h1>
++<p class="subtitle">Chromium 已经拿到登录凭据，可以关闭此页面。<br>
++Chromium already received the credentials; you can close this tab.</p>
++<dl>
++  <dt>账号 / Account</dt><dd>${escapeHtml(email)}</dd>
++  <dt>Gaia ID</dt><dd>${escapeHtml(gaiaId)}</dd>
++</dl>
++${continueLink}`,
++  });
++}
++
++/**
++ * @param {object} options
++ * @param {number} options.status
++ * @param {string} options.title
++ * @param {string} options.message
++ */
++export function renderErrorPage({status, title, message}) {
++  return layout({
++    title,
++    body: `<h1>${escapeHtml(title)}</h1>
++<p class="subtitle">HTTP ${status}</p>
++<p class="error">${escapeHtml(message)}</p>`,
++  });
++}
++
++/**
++ * @param {object} options
++ * @param {string} [options.email]
++ * @param {string} [options.error]
++ * @param {string} [options.continueUrl]
++ * @param {string} [options.serviceName]
++ */
++export function renderSignupPage({
++  email = '',
++  error = '',
++  continueUrl = '',
++  serviceName = 'afree',
++}) {
++  const errorBlock = error ?
++      `<p class="error">${escapeHtml(error)}</p>` :
++      '';
++  return layout({
++    title: `注册 ${serviceName}`,
++    body: `<h1>注册 ${escapeHtml(serviceName)}</h1>
++<p class="subtitle">Create a ${escapeHtml(serviceName)} account</p>
++${errorBlock}
++<form method="post" action="/signup" autocomplete="on">
++  <input type="hidden" name="continue" value="${escapeHtml(continueUrl)}">
++  <label>
++    <span>邮箱 / Email</span>
++    <input type="email" name="email" value="${escapeHtml(email)}"
++           autocomplete="username" required autofocus>
++  </label>
++  <label>
++    <span>密码 / Password (至少 8 位)</span>
++    <input type="password" name="password" autocomplete="new-password"
++           minlength="8" required>
++  </label>
++  <button type="submit">注册 / Create account</button>
++</form>
++<p class="hint">已有账号？<a href="/signin/chrome/sync">返回登录</a></p>`,
++  });
++}
++
++/**
++ * @param {object} options
++ * @param {string} [options.continueUrl]
++ * @param {string} [options.serviceName]
++ */
++export function renderSignedOutPage({continueUrl = '', serviceName = 'afree'}) {
++  const continueLink = continueUrl ?
++      `<div class="actions">
++         <a class="primary" href="${escapeHtml(continueUrl)}">继续 / Continue</a>
++       </div>` :
++      '';
++  return layout({
++    title: `已退出 ${serviceName}`,
++    body: `<h1>已退出 / Signed out</h1>
++<p class="subtitle">本机的 ${escapeHtml(serviceName)} 登录 cookie 已清除。<br>
++The ${escapeHtml(serviceName)} sign-in cookies have been cleared.</p>
++${continueLink}`,
++  });
++}
++
++/**
++ * @param {object} options
++ * @param {string} options.publicUrl
++ * @param {string} options.serviceName
++ */
++export function renderIndexPage({publicUrl, serviceName}) {
++  return layout({
++    title: `${serviceName} login service`,
++    body: `<h1>${escapeHtml(serviceName)} 登录服务</h1>
++<p class="subtitle">Gaia-compatible sign-in endpoint for Chromium/afree.</p>
++<dl>
++  <dt>Origin</dt><dd>${escapeHtml(publicUrl)}</dd>
++  <dt>Status</dt><dd>running</dd>
++</dl>
++<ul class="endpoints">
++  <li><code>GET/POST /signin/chrome/sync</code> — sign-in page</li>
++  <li><code>POST /ListAccounts</code> — base64 binary <code>ListAccountsResponse</code></li>
++  <li><code>POST /oauth2/v4/token</code> — OAuth2 token exchange</li>
++  <li><code>GET /oauth2/v1/userinfo</code> — user profile</li>
++  <li><code>POST /oauth/multilogin</code> — cookie propagation</li>
++  <li><code>GET /GetCheckConnectionInfo</code> — connection info</li>
++  <li><code>GET /Logout</code> — sign-out</li>
++</ul>
++<p class="hint">使用 <code>--gaia-config</code> 让 Chromium 指向此服务。
++Point Chromium at this service with <code>--gaia-config</code>.</p>`,
++  });
++}
+diff --git a/tools/afree-login-service/test/protocol.test.mjs b/tools/afree-login-service/test/protocol.test.mjs
+new file mode 100644
+index 0000000000..fb1294931f
+--- /dev/null
++++ b/tools/afree-login-service/test/protocol.test.mjs
+@@ -0,0 +1,355 @@
++// Copyright 2026 The afree Authors
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++// End-to-end protocol tests. These exercise the same wire formats Chromium
++// uses:
++//   * the DICE sign-in response header (components/signin/core/browser)
++//   * base64 binary gaia.ListAccountsResponse
++//   * the OAuth2 token endpoint
++//   * MultiBearer /oauth/multilogin with the XSSI prefix
++
++import assert from 'node:assert/strict';
++import {after, before, test} from 'node:test';
++import {mkdtempSync, rmSync} from 'node:fs';
++import {tmpdir} from 'node:os';
++import path from 'node:path';
++
++import {createLogger} from '../src/config.mjs';
++import {Store} from '../src/db.mjs';
++import {createHttpServer} from '../src/server.mjs';
++import {decodeListAccountsResponseBase64} from '../src/proto.mjs';
++
++const EMAIL = 'tester@example.com';
++const PASSWORD = 'correct horse battery staple';
++
++/** @type {Store} */
++let store;
++/** @type {import('node:http').Server} */
++let server;
++/** @type {string} */
++let base;
++/** @type {string} */
++let tempDir;
++/** @type {Map<string, string>} */
++const cookies = new Map();
++
++/** @param {string} pathname @param {object} [options] */
++async function request(pathname, options = {}) {
++  const {method = 'GET', headers = {}, body} = options;
++  const response = await fetch(`${base}${pathname}`, {
++    method,
++    headers,
++    body,
++    redirect: 'manual',
++  });
++  const text = await response.text();
++  return {
++    status: response.status,
++    headers: response.headers,
++    setCookies: response.headers.getSetCookie(),
++    text,
++  };
++}
++
++/** @param {string[]} setCookies */
++function storeCookies(setCookies) {
++  for (const raw of setCookies) {
++    const [pair] = raw.split(';');
++    const index = pair.indexOf('=');
++    const name = pair.slice(0, index);
++    const value = pair.slice(index + 1);
++    if (/Max-Age=0(;|$)/i.test(raw)) {
++      cookies.delete(name);
++    } else {
++      cookies.set(name, value);
++    }
++  }
++}
++
++function cookieHeader() {
++  return [...cookies].map(([name, value]) => `${name}=${value}`).join('; ');
++}
++
++/** @param {string} diceHeader */
++function parseDiceHeader(diceHeader) {
++  /** @type {Record<string, string>} */
++  const result = {};
++  for (const part of diceHeader.split(',')) {
++    const index = part.indexOf('=');
++    result[part.slice(0, index)] = decodeURIComponent(part.slice(index + 1));
++  }
++  return result;
++}
++
++before(async () => {
++  tempDir = mkdtempSync(path.join(tmpdir(), 'afree-login-test-'));
++  store = Store.open(path.join(tempDir, 'test.sqlite3'));
++  store.createUser({email: EMAIL, password: PASSWORD, displayName: 'Tester'});
++
++  /** @type {import('../src/config.mjs').Config} */
++  const config = {
++    host: '127.0.0.1',
++    port: 0,
++    dbPath: path.join(tempDir, 'test.sqlite3'),
++    publicUrl: 'http://127.0.0.1',
++    cookieHost: '127.0.0.1',
++    secureCookies: false,
++    accessTokenTtlSeconds: 3600,
++    refreshTokenTtlDays: 0,
++    authCodeTtlSeconds: 300,
++    sessionTtlDays: 30,
++    logLevel: 'silent',
++    allowRegistration: false,
++    allowedContinueHosts: [],
++    emitOAuthCodeCookie: true,
++    redirectContinue: false,
++  };
++
++  const {server: created} =
++      createHttpServer({store, config, logger: createLogger('silent')});
++  server = created;
++  await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
++  const address = server.address();
++  base = `http://127.0.0.1:${address.port}`;
++  config.port = address.port;
++  config.publicUrl = base;
++});
++
++after(async () => {
++  await new Promise((resolve) => server.close(resolve));
++  store.close();
++  rmSync(tempDir, {recursive: true, force: true});
++});
++
++test('sign-in page renders a form', async () => {
++  const response = await request('/signin/chrome/sync?ssp=1&continue=https%3A%2F%2Fexample.com%2F');
++  assert.equal(response.status, 200);
++  assert.match(response.text, /<form method="post" action="" autocomplete="on">/);
++});
++
++test('wrong password does not set cookies', async () => {
++  const response = await request('/signin/chrome/sync', {
++    method: 'POST',
++    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
++    body: new URLSearchParams({email: EMAIL, password: 'wrong'}).toString(),
++  });
++  assert.equal(response.status, 401);
++  assert.equal(response.setCookies.length, 0);
++  assert.match(response.text, /Wrong email or password/);
++});
++
++let authCode = '';
++let gaiaId = '';
++
++test('sign-in returns the DICE header and GAIA cookies', async () => {
++  const response = await request('/signin/chrome/sync?ssp=1', {
++    method: 'POST',
++    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
++    body: new URLSearchParams({email: EMAIL, password: PASSWORD}).toString(),
++  });
++
++  assert.equal(response.status, 200);
++  storeCookies(response.setCookies);
++
++  for (const name of ['SID', 'LSID', 'HSID', 'SSID', 'APISID', 'SAPISID']) {
++    assert.ok(cookies.has(name), `missing ${name} cookie`);
++  }
++
++  const dice = response.headers.get('x-chrome-id-consistency-response');
++  assert.ok(dice, 'missing X-Chrome-ID-Consistency-Response');
++  const parsed = parseDiceHeader(dice);
++  assert.equal(parsed.action, 'SIGNIN');
++  assert.equal(parsed.email, EMAIL);
++  assert.equal(parsed.authuser, '0');
++  assert.ok(parsed.authorization_code.length > 20);
++  assert.ok(parsed.id.length > 10);
++
++  authCode = parsed.authorization_code;
++  gaiaId = parsed.id;
++
++  // The legacy inline flow reads this cookie.
++  assert.ok(response.text.includes('已登录 / Signed in'));
++});
++
++test('ListAccounts returns base64 binary protobuf', async () => {
++  // Chromium POSTs with a single space body.
++  const response = await request('/ListAccounts?gpsia=1&source=chrome&json=standard&laf=b64bin', {
++    method: 'POST',
++    headers: {Cookie: cookieHeader(), Origin: 'https://www.google.com'},
++    body: ' ',
++  });
++  assert.equal(response.status, 200);
++
++  const accounts = decodeListAccountsResponseBase64(response.text);
++  assert.equal(accounts.length, 1);
++  assert.equal(accounts[0].displayEmail, EMAIL);
++  assert.equal(accounts[0].obfuscatedId, gaiaId);
++  assert.equal(accounts[0].validSession, true);
++  assert.equal(accounts[0].signedOut, false);
++  assert.equal(accounts[0].isVerified, true);
++});
++
++test('ListAccounts without cookies returns an empty list', async () => {
++  const response = await request('/ListAccounts', {method: 'POST', body: ' '});
++  assert.equal(response.status, 200);
++  assert.deepEqual(decodeListAccountsResponseBase64(response.text), []);
++});
++
++let accessToken = '';
++let refreshToken = '';
++let idToken = '';
++
++test('authorization_code exchange issues tokens', async () => {
++  const response = await request('/oauth2/v4/token', {
++    method: 'POST',
++    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
++    body: new URLSearchParams({
++      scope: 'https://www.googleapis.com/auth/oauth2login',
++      grant_type: 'authorization_code',
++      client_id: 'afree-client-id',
++      client_secret: 'afree-client-secret',
++      code: authCode,
++    }).toString(),
++  });
++  assert.equal(response.status, 200);
++  const payload = JSON.parse(response.text);
++  assert.equal(payload.token_type, 'Bearer');
++  assert.equal(payload.expires_in, 3600);
++  assert.ok(payload.access_token);
++  assert.ok(payload.refresh_token);
++  assert.ok(payload.id_token);
++
++  const claims = JSON.parse(
++      Buffer.from(payload.id_token.split('.')[1], 'base64url').toString('utf8'));
++  assert.equal(claims.sub, gaiaId);
++  assert.equal(claims.email, EMAIL);
++
++  accessToken = payload.access_token;
++  refreshToken = payload.refresh_token;
++  idToken = payload.id_token;
++});
++
++test('authorization codes are single use', async () => {
++  const response = await request('/oauth2/v4/token', {
++    method: 'POST',
++    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
++    body: new URLSearchParams({
++      grant_type: 'authorization_code',
++      client_id: 'afree-client-id',
++      client_secret: 'afree-client-secret',
++      code: authCode,
++    }).toString(),
++  });
++  assert.equal(response.status, 400);
++  assert.equal(JSON.parse(response.text).error, 'invalid_grant');
++});
++
++test('refresh_token grant issues a new access token', async () => {
++  const response = await request('/oauth2/v4/token', {
++    method: 'POST',
++    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
++    body: new URLSearchParams({
++      grant_type: 'refresh_token',
++      client_id: 'afree-client-id',
++      client_secret: 'afree-client-secret',
++      refresh_token: refreshToken,
++      scope: 'https://www.googleapis.com/auth/chromiumsync',
++    }).toString(),
++  });
++  assert.equal(response.status, 200);
++  const payload = JSON.parse(response.text);
++  assert.ok(payload.access_token);
++  assert.equal(payload.refresh_token, undefined);
++});
++
++test('userinfo accepts Bearer tokens', async () => {
++  const response = await request('/oauth2/v1/userinfo', {
++    headers: {Authorization: `Bearer ${accessToken}`},
++  });
++  assert.equal(response.status, 200);
++  const payload = JSON.parse(response.text);
++  assert.equal(payload.id, gaiaId);
++  assert.equal(payload.email, EMAIL);
++  assert.equal(payload.verified_email, EMAIL);
++});
++
++test('userinfo rejects unknown tokens', async () => {
++  const response = await request('/oauth2/v1/userinfo', {
++    headers: {Authorization: 'Bearer not-a-token'},
++  });
++  assert.equal(response.status, 401);
++});
++
++test('multilogin returns cookies with the XSSI prefix', async () => {
++  const response = await request('/oauth/multilogin?source=chrome&reuseCookies=1', {
++    method: 'POST',
++    headers: {
++      'Authorization': `MultiBearer ${accessToken}:${gaiaId}`,
++      'Content-Type': 'application/x-www-form-urlencoded',
++      Cookie: cookieHeader(),
++    },
++    body: ' ',
++  });
++  assert.equal(response.status, 200);
++  assert.ok(response.text.startsWith(")]}'\n"), 'missing XSSI prefix');
++
++  const payload = JSON.parse(response.text.slice(5));
++  assert.equal(payload.status, 'OK');
++  const names = payload.cookies.map((cookie) => cookie.name);
++  for (const name of ['SID', 'LSID', 'HSID', 'SSID', 'APISID', 'SAPISID']) {
++    assert.ok(names.includes(name), `missing ${name} in multilogin cookies`);
++  }
++  const sid = payload.cookies.find((cookie) => cookie.name === 'SID');
++  assert.equal(sid.host, '127.0.0.1');
++  assert.equal(sid.value, cookies.get('SID'));
++});
++
++test('multilogin rejects mismatched accounts', async () => {
++  const response = await request('/oauth/multilogin?source=chrome', {
++    method: 'POST',
++    headers: {Authorization: `MultiBearer ${accessToken}:1234`},
++    body: ' ',
++  });
++  assert.equal(response.status, 400);
++  const payload = JSON.parse(response.text.slice(5));
++  assert.equal(payload.status, 'INVALID_TOKENS');
++});
++
++test('enable_sync returns the ENABLE_SYNC DICE header', async () => {
++  const response = await request('/enable_sync', {
++    headers: {Cookie: cookieHeader()},
++  });
++  assert.equal(response.status, 200);
++  const dice = response.headers.get('x-chrome-id-consistency-response');
++  assert.ok(dice);
++  assert.match(dice, /^action=ENABLE_SYNC/);
++  assert.match(dice, new RegExp(`id=${gaiaId}`));
++});
++
++test('GetCheckConnectionInfo is an empty JSON list', async () => {
++  const response = await request('/GetCheckConnectionInfo');
++  assert.equal(response.status, 200);
++  assert.deepEqual(JSON.parse(response.text), []);
++});
++
++test('logout clears cookies and emits the signout header', async () => {
++  const response = await request('/Logout?source=chrome', {
++    headers: {Cookie: cookieHeader()},
++  });
++  assert.equal(response.status, 200);
++  assert.ok(response.setCookies.some((cookie) => /^SID=;/.test(cookie)));
++  const signout = response.headers.get('google-accounts-signout');
++  assert.ok(signout.includes(`email="${EMAIL}"`));
++  assert.ok(signout.includes(`obfuscatedid="${gaiaId}"`));
++
++  storeCookies(response.setCookies);
++  assert.equal(cookies.has('SID'), false);
++
++  const list = await request('/ListAccounts', {
++    method: 'POST',
++    headers: {Cookie: cookieHeader()},
++    body: ' ',
++  });
++  assert.deepEqual(decodeListAccountsResponseBase64(list.text), []);
++});
+-- 
+2.56.1
+
